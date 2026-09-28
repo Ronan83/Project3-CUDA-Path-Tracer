@@ -7,6 +7,7 @@
 #include <thrust/random.h>
 #include <thrust/remove.h>
 #include <thrust/partition.h>
+#include <thrust/sort.h>
 
 #include "sceneStructs.h"
 #include "scene.h"
@@ -333,6 +334,17 @@ struct isAlive
     }
 };
 
+#define SORT_BY_MATERIAL 0
+
+struct MaterialIdLess
+{
+    __host__ __device__ bool operator()(const ShadeableIntersection& a,
+        const ShadeableIntersection& b) const
+    {
+        return a.materialId < b.materialId;
+    }
+};
+
 // Add the current iteration's output to the overall image
 __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
 {
@@ -433,6 +445,13 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         // materials you have in the scenefile.
         // TODO: compare between directly shading the path segments and shading
         // path segments that have been reshuffled to be contiguous in memory.
+
+        #if SORT_BY_MATERIAL
+            thrust::sort_by_key(thrust::device,
+                dev_intersections, dev_intersections + num_paths,
+                dev_paths,
+                MaterialIdLess());
+        #endif
 
         shadeMaterial << <numblocksPathSegmentTracing, blockSize1d >> > (
             iter,
