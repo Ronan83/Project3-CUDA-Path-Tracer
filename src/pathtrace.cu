@@ -6,6 +6,7 @@
 #include <thrust/execution_policy.h>
 #include <thrust/random.h>
 #include <thrust/remove.h>
+#include <thrust/partition.h>
 
 #include "sceneStructs.h"
 #include "scene.h"
@@ -147,9 +148,14 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
         // TODO: implement antialiasing by jittering the ray
+        thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, 0);
+        thrust::uniform_real_distribution<float> u01(0, 1);
+        float jx = u01(rng) - 0.5f;
+        float jy = u01(rng) - 0.5f;
+
         segment.ray.direction = glm::normalize(cam.view
-            - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f)
-            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f)
+            - cam.right * cam.pixelLength.x * ((float)x + jx - (float)cam.resolution.x * 0.5f)
+            - cam.up * cam.pixelLength.y * ((float)y + jy - (float)cam.resolution.y * 0.5f)
         );
 
         segment.pixelIndex = index;
@@ -280,6 +286,53 @@ __global__ void shadeFakeMaterial(
     }
 }
 
+__global__ void shadeMaterial(
+    int iter,
+    int num_paths,
+    ShadeableIntersection* shadeableIntersections,
+    PathSegment* pathSegments,
+    Material* materials)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_paths) return;
+
+    PathSegment& seg = pathSegments[idx];
+    if (seg.remainingBounces <= 0) return;
+
+    ShadeableIntersection isect = shadeableIntersections[idx];
+
+    if (isect.t <= 0.0f) {
+        seg.color = glm::vec3(0.0f);
+        seg.remainingBounces = 0;
+        return;
+    }
+
+    Material m = materials[isect.materialId];
+
+    if (m.emittance > 0.0f) {
+        seg.color *= m.color * m.emittance;
+        seg.remainingBounces = 0;
+        return;
+    }
+
+    thrust::default_random_engine rng = makeSeededRandomEngine(iter, idx, seg.remainingBounces);
+    glm::vec3 hitPoint = getPointOnRay(seg.ray, isect.t);
+    scatterRay(seg, hitPoint, isect.surfaceNormal, m, rng);
+    seg.remainingBounces--;
+
+    if (seg.remainingBounces == 0) {
+        seg.color = glm::vec3(0.0f);
+    }
+}
+
+struct isAlive
+{
+    __host__ __device__ bool operator()(const PathSegment& s) const
+    {
+        return s.remainingBounces > 0;
+    }
+};
+
 // Add the current iteration's output to the overall image
 __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
 {
@@ -381,14 +434,20 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         // TODO: compare between directly shading the path segments and shading
         // path segments that have been reshuffled to be contiguous in memory.
 
-        shadeFakeMaterial<<<numblocksPathSegmentTracing, blockSize1d>>>(
+        shadeMaterial << <numblocksPathSegmentTracing, blockSize1d >> > (
             iter,
             num_paths,
             dev_intersections,
             dev_paths,
             dev_materials
-        );
-        iterationComplete = true; // TODO: should be based off stream compaction results.
+            );
+
+        PathSegment* alive_end = thrust::partition(
+            thrust::device, dev_paths, dev_paths + num_paths, isAlive());
+        num_paths = alive_end - dev_paths;
+
+        iterationComplete = (num_paths == 0 || depth >= traceDepth);
+        // TODO: should be based off stream compaction results.
 
         if (guiData != NULL)
         {
@@ -398,7 +457,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
     // Assemble this iteration and apply it to the image
     dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
-    finalGather<<<numBlocksPixels, blockSize1d>>>(num_paths, dev_image, dev_paths);
+    finalGather<<<numBlocksPixels, blockSize1d>>>(pixelcount, dev_image, dev_paths);
 
     ///////////////////////////////////////////////////////////////////////////
 

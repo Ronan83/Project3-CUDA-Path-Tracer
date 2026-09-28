@@ -24,6 +24,12 @@
 #include <sstream>
 #include <string>
 
+// Force the use of the discrete NVIDIA GPU on hybrid-graphics systems.
+extern "C" {
+    __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
 static std::string startTimeString;
 
 // For camera controls
