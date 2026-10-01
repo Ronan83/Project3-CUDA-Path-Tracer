@@ -159,6 +159,24 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
             - cam.up * cam.pixelLength.y * ((float)y + jy - (float)cam.resolution.y * 0.5f)
         );
 
+        if (cam.lensRadius > 0.0f) {
+            // The point where the light from the pinhole strikes the focal plane
+            float ft = cam.focalDistance / glm::dot(segment.ray.direction, cam.view);
+            glm::vec3 pFocus = cam.position + ft * segment.ray.direction;
+
+            // Select a random point uniformly on the lens disk
+            float r = cam.lensRadius * sqrtf(u01(rng));
+            float theta = TWO_PI * u01(rng);
+            glm::vec3 lensPoint = cam.position
+                + r * cosf(theta) * cam.right
+                + r * sinf(theta) * cam.up;
+
+            // Start from the point on the lens and aim at the focal point
+            segment.ray.origin = lensPoint;
+            segment.ray.direction = glm::normalize(pFocus - lensPoint);
+        }
+
+
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
     }
