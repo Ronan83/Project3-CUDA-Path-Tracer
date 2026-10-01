@@ -187,6 +187,7 @@ __global__ void computeIntersections(
         glm::vec3 normal;
         float t_min = FLT_MAX;
         int hit_geom_index = -1;
+        bool hit_outside = true;
         bool outside = true;
 
         glm::vec3 tmp_intersect;
@@ -214,6 +215,7 @@ __global__ void computeIntersections(
             {
                 t_min = t;
                 hit_geom_index = i;
+                hit_outside = outside;
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
             }
@@ -229,6 +231,7 @@ __global__ void computeIntersections(
             intersections[path_index].t = t_min;
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
             intersections[path_index].surfaceNormal = normal;
+            intersections[path_index].outside = hit_outside;
         }
     }
 }
@@ -318,7 +321,7 @@ __global__ void shadeMaterial(
 
     thrust::default_random_engine rng = makeSeededRandomEngine(iter, idx, seg.remainingBounces);
     glm::vec3 hitPoint = getPointOnRay(seg.ray, isect.t);
-    scatterRay(seg, hitPoint, isect.surfaceNormal, m, rng);
+    scatterRay(seg, hitPoint, isect.surfaceNormal, isect.outside, m, rng);
     seg.remainingBounces--;
 
     if (seg.remainingBounces == 0) {
