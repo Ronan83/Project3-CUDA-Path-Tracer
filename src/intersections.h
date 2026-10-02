@@ -6,6 +6,7 @@
 #include <glm/gtx/intersect.hpp>
 
 #define MESH_BBOX_CULLING 1
+#define USE_BVH 1
 
 
 /**
@@ -84,6 +85,7 @@ __host__ __device__ float triangleIntersectionTest(const Triangle& tri, const Ra
 __host__ __device__ float meshIntersectionTest(
     Geom mesh,
     const Triangle* triangles,
+    const BVHNode* nodes,
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,

@@ -22,6 +22,16 @@ struct Triangle
     glm::vec3 n0, n1, n2;   
 };
 
+
+// 32 bytes: two nodes per 64-byte cache line
+struct BVHNode
+{
+    glm::vec3 bboxMin;
+    int leftOrFirst;   // interior: left child index (right = left + 1); leaf: first triangle index
+    glm::vec3 bboxMax;
+    int triCount;      // 0 = interior, > 0 = leaf
+};
+
 struct Ray
 {
     glm::vec3 origin;
@@ -42,6 +52,7 @@ struct Geom
     int triCount;
     glm::vec3 bboxMin;
     glm::vec3 bboxMax;
+    int bvhRoot;
 };
 
 struct Material

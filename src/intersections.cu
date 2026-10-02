@@ -148,25 +148,91 @@ __host__ __device__ float triangleIntersectionTest(const Triangle& tri, const Ra
     return t > 0.0f ? t : -1.0f;
 }
 
+// Distance along the ray to the box, or FLT_MAX if the ray misses it
+// or the box starts beyond tMax (the closest hit found so far)
+__host__ __device__ float aabbHitDistance(glm::vec3 bmin, glm::vec3 bmax, glm::vec3 origin, glm::vec3 invD, float tMax)
+{
+    glm::vec3 t0 = (bmin - origin) * invD;
+    glm::vec3 t1 = (bmax - origin) * invD;
+    glm::vec3 tNearV = glm::min(t0, t1);
+    glm::vec3 tFarV = glm::max(t0, t1);
+    float tNear = fmaxf(fmaxf(tNearV.x, tNearV.y), tNearV.z);
+    float tFar = fminf(fminf(tFarV.x, tFarV.y), tFarV.z);
+    if (tFar < fmaxf(tNear, 0.0f) || tNear > tMax) return FLT_MAX;
+    return fmaxf(tNear, 0.0f);
+}
+
 __host__ __device__ float meshIntersectionTest(
     Geom mesh,
     const Triangle* triangles,
+    const BVHNode* nodes,
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,
     bool& outside)
 {
+    float tMin = FLT_MAX;
+    int hit = -1;   // absolute triangle index
+    float hitU = 0.0f, hitV = 0.0f;
+
+#if USE_BVH
+    glm::vec3 invD = 1.0f / r.direction;
+
+    // Iterative traversal with a per-thread stack (no recursion on the GPU)
+    int stackNode[64];
+    float stackDist[64];
+    int sp = 0;
+
+    float dRoot = aabbHitDistance(nodes[mesh.bvhRoot].bboxMin, nodes[mesh.bvhRoot].bboxMax, r.origin, invD, tMin);
+    if (dRoot == FLT_MAX) return -1.0f;
+    stackNode[sp] = mesh.bvhRoot;
+    stackDist[sp] = dRoot;
+    sp++;
+
+    while (sp > 0)
+    {
+        sp--;
+        if (stackDist[sp] > tMin) continue;   // a closer hit was found after this node was pushed
+        const BVHNode& node = nodes[stackNode[sp]];
+
+        if (node.triCount > 0)   // leaf
+        {
+            for (int i = node.leftOrFirst; i < node.leftOrFirst + node.triCount; i++)
+            {
+                float u, v;
+                float t = triangleIntersectionTest(triangles[i], r, u, v);
+                if (t > 0.0f && t < tMin)
+                {
+                    tMin = t;
+                    hit = i;
+                    hitU = u;
+                    hitV = v;
+                }
+            }
+        }
+        else   // interior: push the farther child first so the nearer one is visited first
+        {
+            int a = node.leftOrFirst;
+            int b = a + 1;
+            float dA = aabbHitDistance(nodes[a].bboxMin, nodes[a].bboxMax, r.origin, invD, tMin);
+            float dB = aabbHitDistance(nodes[b].bboxMin, nodes[b].bboxMax, r.origin, invD, tMin);
+            if (dA > dB)
+            {
+                int ti = a; a = b; b = ti;
+                float tf = dA; dA = dB; dB = tf;
+            }
+            if (dB != FLT_MAX) { stackNode[sp] = b; stackDist[sp] = dB; sp++; }
+            if (dA != FLT_MAX) { stackNode[sp] = a; stackDist[sp] = dA; sp++; }
+        }
+    }
+#else
 #if MESH_BBOX_CULLING
     if (!aabbIntersectionTest(mesh.bboxMin, mesh.bboxMax, r)) return -1.0f;
 #endif
-
-    float tMin = FLT_MAX;
-    int hit = -1;
-    float hitU = 0.0f, hitV = 0.0f;
-    for (int i = 0; i < mesh.triCount; i++)
+    for (int i = mesh.triStart; i < mesh.triStart + mesh.triCount; i++)
     {
         float u, v;
-        float t = triangleIntersectionTest(triangles[mesh.triStart + i], r, u, v);
+        float t = triangleIntersectionTest(triangles[i], r, u, v);
         if (t > 0.0f && t < tMin)
         {
             tMin = t;
@@ -175,14 +241,17 @@ __host__ __device__ float meshIntersectionTest(
             hitV = v;
         }
     }
+#endif
+
     if (hit < 0) return -1.0f;
 
-    const Triangle& tri = triangles[mesh.triStart + hit];
+    const Triangle& tri = triangles[hit];
     intersectionPoint = r.origin + tMin * r.direction;
 
-    
+    // Smooth shading normal from the vertex normals
     glm::vec3 n = glm::normalize((1.0f - hitU - hitV) * tri.n0 + hitU * tri.n1 + hitV * tri.n2);
 
+    // Geometric normal (winding order) decides inside vs outside
     glm::vec3 geoN = glm::cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
     outside = glm::dot(r.direction, geoN) < 0.0f;
     normal = outside ? n : -n;

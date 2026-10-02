@@ -11,6 +11,9 @@
 
 #include <cfloat>
 
+#include <algorithm>
+#include <chrono>
+
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -176,7 +179,7 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
 
     for (const auto& shape : shapes)
     {
-        const auto& idx = shape.mesh.indices;   // LoadObj 默认会三角化：每 3 个索引是一个三角形
+        const auto& idx = shape.mesh.indices;  
         for (size_t f = 0; f + 2 < idx.size(); f += 3)
         {
             glm::vec3 v[3], n[3];
@@ -187,7 +190,7 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
                 glm::vec3 pos(attrib.vertices[3 * id.vertex_index + 0],
                     attrib.vertices[3 * id.vertex_index + 1],
                     attrib.vertices[3 * id.vertex_index + 2]);
-                v[k] = glm::vec3(geom.transform * glm::vec4(pos, 1.0f));   // 变换到世界坐标
+                v[k] = glm::vec3(geom.transform * glm::vec4(pos, 1.0f));   // chenge to world coordinate
 
                 if (id.normal_index >= 0)
                 {
@@ -203,7 +206,7 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
             }
 
             glm::vec3 faceN = glm::cross(v[1] - v[0], v[2] - v[0]);
-            if (glm::length(faceN) < 1e-12f) continue;   // 跳过退化的三角形
+            if (glm::length(faceN) < 1e-12f) continue;   
             if (!hasNormals)
             {
                 n[0] = n[1] = n[2] = glm::normalize(faceN);
@@ -224,4 +227,86 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
 
     geom.triCount = (int)triangles.size() - geom.triStart;
     cout << "Loaded " << path << ": " << geom.triCount << " triangles" << endl;
+
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int nodesBefore = (int)bvhNodes.size();
+    geom.bvhRoot = buildBVH(geom.triStart, geom.triCount);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    cout << "BVH: " << (bvhNodes.size() - nodesBefore) << " nodes, built in " << ms << " ms" << endl;
+}
+
+
+
+static const int BVH_MAX_LEAF = 4;
+static const int BVH_MAX_DEPTH = 60;   // GPU traversal stack has 64 entries
+
+static glm::vec3 triCentroid(const Triangle& t)
+{
+    return (t.v0 + t.v1 + t.v2) / 3.0f;
+}
+
+int Scene::buildBVH(int first, int count)
+{
+    int root = (int)bvhNodes.size();
+    bvhNodes.push_back(BVHNode());
+    buildBVHNode(root, first, count, 0);
+    return root;
+}
+
+void Scene::buildBVHNode(int nodeIdx, int first, int count, int depth)
+{
+    // Bounds of the triangles and of their centroids
+    glm::vec3 bmin(FLT_MAX), bmax(-FLT_MAX), cmin(FLT_MAX), cmax(-FLT_MAX);
+    for (int i = first; i < first + count; i++)
+    {
+        const Triangle& t = triangles[i];
+        bmin = glm::min(bmin, glm::min(t.v0, glm::min(t.v1, t.v2)));
+        bmax = glm::max(bmax, glm::max(t.v0, glm::max(t.v1, t.v2)));
+        glm::vec3 c = triCentroid(t);
+        cmin = glm::min(cmin, c);
+        cmax = glm::max(cmax, c);
+    }
+    // bvhNodes may reallocate during recursion: always index, never hold a reference
+    bvhNodes[nodeIdx].bboxMin = bmin;
+    bvhNodes[nodeIdx].bboxMax = bmax;
+
+    // Split along the longest axis of the centroid bounds
+    glm::vec3 ext = cmax - cmin;
+    int axis = 0;
+    if (ext.y > ext.x) axis = 1;
+    if (ext.z > ext[axis]) axis = 2;
+
+    if (count <= BVH_MAX_LEAF || depth >= BVH_MAX_DEPTH || ext[axis] <= 0.0f)
+    {
+        bvhNodes[nodeIdx].leftOrFirst = first;
+        bvhNodes[nodeIdx].triCount = count;
+        return;
+    }
+
+    // Midpoint split
+    float split = cmin[axis] + 0.5f * ext[axis];
+    auto begin = triangles.begin() + first;
+    auto end = begin + count;
+    auto mid = std::partition(begin, end,
+        [&](const Triangle& t) { return triCentroid(t)[axis] < split; });
+    int leftCount = (int)(mid - begin);
+
+    // Midpoint put everything on one side: fall back to a median split
+    if (leftCount == 0 || leftCount == count)
+    {
+        leftCount = count / 2;
+        std::nth_element(begin, begin + leftCount, end,
+            [&](const Triangle& a, const Triangle& b) { return triCentroid(a)[axis] < triCentroid(b)[axis]; });
+    }
+
+    int left = (int)bvhNodes.size();
+    bvhNodes.push_back(BVHNode());   // left child
+    bvhNodes.push_back(BVHNode());   // right child, always at left + 1
+    bvhNodes[nodeIdx].leftOrFirst = left;
+    bvhNodes[nodeIdx].triCount = 0;
+
+    buildBVHNode(left, first, leftCount, depth + 1);
+    buildBVHNode(left + 1, first + leftCount, count - leftCount, depth + 1);
 }
