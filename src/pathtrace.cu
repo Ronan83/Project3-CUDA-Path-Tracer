@@ -8,7 +8,7 @@
 #include <thrust/remove.h>
 #include <thrust/partition.h>
 #include <thrust/sort.h>
-
+#include <thrust/count.h>
 #include "sceneStructs.h"
 #include "scene.h"
 #include "glm/glm.hpp"
@@ -19,6 +19,11 @@
 
 #define ERRORCHECK 1
 #define RUSSIAN_ROULETTE 1
+
+#define STREAM_COMPACTION 1
+#define PROFILE 1             // time each stage with CUDA events
+#define LOG_BOUNCE_ITER 10    // print alive paths per bounce on this iteration
+#define PROFILE_WINDOW 200    // print average stage times every N iterations
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -86,7 +91,27 @@ static ShadeableIntersection* dev_intersections = NULL;
 static Triangle* dev_triangles = NULL;
 static BVHNode* dev_bvhNodes = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
-// ...
+
+#if PROFILE
+static cudaEvent_t evStart = NULL, evStop = NULL;
+static double timeIntersect = 0.0, timeSort = 0.0, timeShade = 0.0, timeCompact = 0.0;
+static int profiledIters = 0;
+
+// Milliseconds since the last PROFILE_BEGIN()
+static float elapsedMs()
+{
+    cudaEventRecord(evStop);
+    cudaEventSynchronize(evStop);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, evStart, evStop);
+    return ms;
+}
+#define PROFILE_BEGIN() cudaEventRecord(evStart)
+#define PROFILE_END(acc) (acc) += elapsedMs()
+#else
+#define PROFILE_BEGIN()
+#define PROFILE_END(acc)
+#endif
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -130,6 +155,11 @@ void pathtraceInit(Scene* scene)
             scene->bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
     }
 
+    #if PROFILE
+        cudaEventCreate(&evStart);
+        cudaEventCreate(&evStop);
+    #endif
+
     checkCUDAError("pathtraceInit");
 }
 
@@ -143,6 +173,12 @@ void pathtraceFree()
     // TODO: clean up any extra device memory you created
     cudaFree(dev_triangles);
     cudaFree(dev_bvhNodes);
+
+    #if PROFILE
+    // pathtraceFree also runs before the first init, so guard against NULL
+        if (evStart) { cudaEventDestroy(evStart); evStart = NULL; }
+        if (evStop) { cudaEventDestroy(evStop);  evStop = NULL; }
+    #endif
 
     checkCUDAError("pathtraceFree");
 }
@@ -476,15 +512,27 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // --- PathSegment Tracing Stage ---
     // Shoot ray into scene, bounce between objects, push shading chunks
 
+        // Print alive paths per bounce on one chosen iteration
+    bool logBounces = (iter == LOG_BOUNCE_ITER);
+    auto countAlive = [&]() {
+        return (int)thrust::count_if(thrust::device, dev_paths, dev_paths + num_paths, isAlive());
+        };
+    if (logBounces)
+    {
+        printf("--- alive paths per bounce (iter %d, compaction %s) ---\n",
+            iter, STREAM_COMPACTION ? "on" : "off");
+    }
+
     bool iterationComplete = false;
     while (!iterationComplete)
     {
-        // clean shading chunks
-        cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
+        if (logBounces) printf("bounce %d: %d\n", depth, countAlive());
 
-        // tracing
+        cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
-        computeIntersections<<<numblocksPathSegmentTracing, blockSize1d>>> (
+
+        PROFILE_BEGIN();
+        computeIntersections << <numblocksPathSegmentTracing, blockSize1d >> > (
             depth,
             num_paths,
             dev_paths,
@@ -493,27 +541,21 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_triangles,
             dev_bvhNodes,
             dev_intersections
-        );
+            );
+        PROFILE_END(timeIntersect);
         checkCUDAError("trace one bounce");
-        cudaDeviceSynchronize();
         depth++;
 
-        // TODO:
-        // --- Shading Stage ---
-        // Shade path segments based on intersections and generate new rays by
-        // evaluating the BSDF.
-        // Start off with just a big kernel that handles all the different
-        // materials you have in the scenefile.
-        // TODO: compare between directly shading the path segments and shading
-        // path segments that have been reshuffled to be contiguous in memory.
+#if SORT_BY_MATERIAL
+        PROFILE_BEGIN();
+        thrust::sort_by_key(thrust::device,
+            dev_intersections, dev_intersections + num_paths,
+            dev_paths,
+            MaterialIdLess());
+        PROFILE_END(timeSort);
+#endif
 
-        #if SORT_BY_MATERIAL
-            thrust::sort_by_key(thrust::device,
-                dev_intersections, dev_intersections + num_paths,
-                dev_paths,
-                MaterialIdLess());
-        #endif
-
+        PROFILE_BEGIN();
         shadeMaterial << <numblocksPathSegmentTracing, blockSize1d >> > (
             iter,
             depth,
@@ -522,19 +564,40 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_paths,
             dev_materials
             );
+        PROFILE_END(timeShade);
 
+#if STREAM_COMPACTION
+        PROFILE_BEGIN();
         PathSegment* alive_end = thrust::partition(
             thrust::device, dev_paths, dev_paths + num_paths, isAlive());
         num_paths = alive_end - dev_paths;
-
+        PROFILE_END(timeCompact);
         iterationComplete = (num_paths == 0 || depth >= traceDepth);
-        // TODO: should be based off stream compaction results.
+#else
+        // Without compaction dead paths stay in the array, so always run to max depth
+        iterationComplete = (depth >= traceDepth);
+#endif
 
         if (guiData != NULL)
         {
             guiData->TracedDepth = depth;
         }
     }
+
+    if (logBounces) printf("bounce %d: %d\n", depth, countAlive());
+
+#if PROFILE
+    profiledIters++;
+    if (profiledIters == PROFILE_WINDOW)
+    {
+        printf("[avg of %d iters] intersect %.3f | sort %.3f | shade %.3f | compact %.3f ms\n",
+            PROFILE_WINDOW,
+            timeIntersect / PROFILE_WINDOW, timeSort / PROFILE_WINDOW,
+            timeShade / PROFILE_WINDOW, timeCompact / PROFILE_WINDOW);
+        timeIntersect = timeSort = timeShade = timeCompact = 0.0;
+        profiledIters = 0;
+    }
+#endif
 
     // Assemble this iteration and apply it to the image
     dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
