@@ -18,6 +18,7 @@
 #include "interactions.h"
 
 #define ERRORCHECK 1
+#define RUSSIAN_ROULETTE 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -310,6 +311,7 @@ __global__ void shadeFakeMaterial(
 
 __global__ void shadeMaterial(
     int iter,
+    int depth,
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
@@ -341,6 +343,19 @@ __global__ void shadeMaterial(
     glm::vec3 hitPoint = getPointOnRay(seg.ray, isect.t);
     scatterRay(seg, hitPoint, isect.surfaceNormal, isect.outside, m, rng);
     seg.remainingBounces--;
+
+#if RUSSIAN_ROULETTE
+    if (depth >= 3 && seg.remainingBounces > 0) {
+        thrust::uniform_real_distribution<float> u01(0, 1);
+        float pSurvive = glm::min(1.0f, glm::max(seg.color.r, glm::max(seg.color.g, seg.color.b)));
+        if (u01(rng) >= pSurvive) {
+            seg.color = glm::vec3(0.0f);
+            seg.remainingBounces = 0;
+            return;
+        }
+        seg.color /= pSurvive;
+    }
+#endif
 
     if (seg.remainingBounces == 0) {
         seg.color = glm::vec3(0.0f);
@@ -476,6 +491,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
         shadeMaterial << <numblocksPathSegmentTracing, blockSize1d >> > (
             iter,
+            depth,
             num_paths,
             dev_intersections,
             dev_paths,
