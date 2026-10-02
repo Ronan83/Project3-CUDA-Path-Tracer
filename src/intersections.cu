@@ -1,4 +1,5 @@
 #include "intersections.h"
+#include <cfloat>
 
 __host__ __device__ float boxIntersectionTest(
     Geom box,
@@ -110,4 +111,80 @@ __host__ __device__ float sphereIntersectionTest(
     }
 
     return glm::length(r.origin - intersectionPoint);
+}
+
+
+
+__host__ __device__ bool aabbIntersectionTest(glm::vec3 bmin, glm::vec3 bmax, const Ray& r)
+{
+    glm::vec3 invD = 1.0f / r.direction;
+    glm::vec3 t0 = (bmin - r.origin) * invD;
+    glm::vec3 t1 = (bmax - r.origin) * invD;
+    glm::vec3 tNearV = glm::min(t0, t1);
+    glm::vec3 tFarV = glm::max(t0, t1);
+    float tNear = fmaxf(fmaxf(tNearV.x, tNearV.y), tNearV.z);
+    float tFar = fminf(fminf(tFarV.x, tFarV.y), tFarV.z);
+    return tFar >= fmaxf(tNear, 0.0f);
+}
+
+__host__ __device__ float triangleIntersectionTest(const Triangle& tri, const Ray& r, float& u, float& v)
+{
+    glm::vec3 e1 = tri.v1 - tri.v0;
+    glm::vec3 e2 = tri.v2 - tri.v0;
+    glm::vec3 p = glm::cross(r.direction, e2);
+    float det = glm::dot(e1, p);
+    if (fabsf(det) < 1e-12f) return -1.0f;   // 光线和三角形平行
+    float invDet = 1.0f / det;
+
+    glm::vec3 s = r.origin - tri.v0;
+    u = glm::dot(s, p) * invDet;
+    if (u < 0.0f || u > 1.0f) return -1.0f;
+
+    glm::vec3 q = glm::cross(s, e1);
+    v = glm::dot(r.direction, q) * invDet;
+    if (v < 0.0f || u + v > 1.0f) return -1.0f;
+
+    float t = glm::dot(e2, q) * invDet;
+    return t > 0.0f ? t : -1.0f;
+}
+
+__host__ __device__ float meshIntersectionTest(
+    Geom mesh,
+    const Triangle* triangles,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside)
+{
+#if MESH_BBOX_CULLING
+    if (!aabbIntersectionTest(mesh.bboxMin, mesh.bboxMax, r)) return -1.0f;
+#endif
+
+    float tMin = FLT_MAX;
+    int hit = -1;
+    float hitU = 0.0f, hitV = 0.0f;
+    for (int i = 0; i < mesh.triCount; i++)
+    {
+        float u, v;
+        float t = triangleIntersectionTest(triangles[mesh.triStart + i], r, u, v);
+        if (t > 0.0f && t < tMin)
+        {
+            tMin = t;
+            hit = i;
+            hitU = u;
+            hitV = v;
+        }
+    }
+    if (hit < 0) return -1.0f;
+
+    const Triangle& tri = triangles[mesh.triStart + hit];
+    intersectionPoint = r.origin + tMin * r.direction;
+
+    
+    glm::vec3 n = glm::normalize((1.0f - hitU - hitV) * tri.n0 + hitU * tri.n1 + hitV * tri.n2);
+
+    glm::vec3 geoN = glm::cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
+    outside = glm::dot(r.direction, geoN) < 0.0f;
+    normal = outside ? n : -n;
+    return tMin;
 }

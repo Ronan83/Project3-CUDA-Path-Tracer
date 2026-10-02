@@ -83,6 +83,7 @@ static Geom* dev_geoms = NULL;
 static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
+static Triangle* dev_triangles = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 
@@ -114,6 +115,13 @@ void pathtraceInit(Scene* scene)
 
     // TODO: initialize any extra device memeory you need
 
+    if (!scene->triangles.empty())
+    {
+        cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
+        cudaMemcpy(dev_triangles, scene->triangles.data(),
+            scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+    }
+
     checkCUDAError("pathtraceInit");
 }
 
@@ -125,6 +133,7 @@ void pathtraceFree()
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
     // TODO: clean up any extra device memory you created
+    cudaFree(dev_triangles);
 
     checkCUDAError("pathtraceFree");
 }
@@ -193,6 +202,7 @@ __global__ void computeIntersections(
     PathSegment* pathSegments,
     Geom* geoms,
     int geoms_size,
+    Triangle* triangles,
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -227,7 +237,10 @@ __global__ void computeIntersections(
                 t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
             }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
-
+            else if (geom.type == MESH)
+            {
+                t = meshIntersectionTest(geom, triangles, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+            }
             // Compute the minimum t from the intersection tests to determine what
             // scene geometry object was hit first.
             if (t > 0.0f && t_min > t)
@@ -467,6 +480,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_paths,
             dev_geoms,
             hst_scene->geoms.size(),
+            dev_triangles,
             dev_intersections
         );
         checkCUDAError("trace one bounce");
