@@ -63,7 +63,8 @@ thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int de
 }
 
 //Kernel that writes the image to the OpenGL PBO directly.
-__global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm::vec3* image, bool toneMap)
+__global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm::vec3* image, bool toneMap,
+    const glm::vec3* bloom, float bloomStrength)
 {
     int x = (blockIdx.x * blockDim.x) + threadIdx.x;
     int y = (blockIdx.y * blockDim.y) + threadIdx.y;
@@ -74,7 +75,9 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
         glm::vec3 pix = image[index];
 
         glm::ivec3 color;
-        glm::vec3 d = toDisplay(pix / (float)iter, toneMap);
+        glm::vec3 hdr = pix / (float)iter;
+        if (bloom) hdr += bloomStrength * bloom[index];
+        glm::vec3 d = toDisplay(hdr, toneMap);
         color.x = (int)(d.x * 255.0f);
         color.y = (int)(d.y * 255.0f);
         color.z = (int)(d.z * 255.0f);
@@ -85,6 +88,35 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
         pbo[index].y = color.y;
         pbo[index].z = color.z;
     }
+}
+
+// Keep only the energy above the threshold (linear HDR, before tone mapping)
+__global__ void brightPass(const glm::vec3* image, glm::vec3* out, int n, int iter, float threshold)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    glm::vec3 c = image[i] / (float)iter;
+    out[i] = glm::max(c - glm::vec3(threshold), glm::vec3(0.0f));
+}
+
+// One direction of a separable Gaussian blur (run twice: horizontal, then vertical)
+__global__ void blurPass(const glm::vec3* in, glm::vec3* out, int w, int h,
+    int radius, float sigma, bool horizontal)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    glm::vec3 sum(0.0f);
+    float wsum = 0.0f;
+    for (int k = -radius; k <= radius; k++)
+    {
+        int xx = horizontal ? min(max(x + k, 0), w - 1) : x;
+        int yy = horizontal ? y : min(max(y + k, 0), h - 1);
+        float wgt = expf(-(float)(k * k) / (2.0f * sigma * sigma));
+        sum += wgt * in[yy * w + xx];
+        wsum += wgt;
+    }
+    out[y * w + x] = sum / wsum;
 }
 
 static Scene* hst_scene = NULL;
@@ -102,6 +134,8 @@ static float* dev_envCdf = NULL;
 static glm::vec3* dev_texPixels = NULL;
 static TextureInfo* dev_texInfo = NULL;
 static int* dev_lights = NULL;
+static glm::vec3* dev_bloomA = NULL;
+static glm::vec3* dev_bloomB = NULL;
 
 #if PROFILE
 static cudaEvent_t evStart = NULL, evStop = NULL;
@@ -195,6 +229,10 @@ void pathtraceInit(Scene* scene)
             scene->lights.size() * sizeof(int), cudaMemcpyHostToDevice);
     }
 
+    cudaMalloc(&dev_bloomA, pixelcount * sizeof(glm::vec3));
+    cudaMalloc(&dev_bloomB, pixelcount * sizeof(glm::vec3));
+    hst_scene->state.bloom.assign(pixelcount, glm::vec3(0.0f));
+
     #if PROFILE
         cudaEventCreate(&evStart);
         cudaEventCreate(&evStop);
@@ -217,6 +255,9 @@ void pathtraceFree()
     cudaFree(dev_texPixels); dev_texPixels = NULL;
     cudaFree(dev_texInfo);   dev_texInfo = NULL;
     cudaFree(dev_lights);    dev_lights = NULL;
+
+    cudaFree(dev_bloomA); dev_bloomA = NULL;
+    cudaFree(dev_bloomB); dev_bloomB = NULL;
 
     cudaFree(dev_envMap);
     dev_envMap = NULL;
@@ -916,11 +957,26 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     ///////////////////////////////////////////////////////////////////////////
 
     // Send results to OpenGL buffer for rendering
-    sendImageToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, iter, dev_image, hst_scene->state.toneMap);
+        // Bloom: bright pass + separable Gaussian blur, composited at display time only
+    const RenderState& rs = hst_scene->state;
+    bool bloomOn = rs.bloomStrength > 0.0f;
+    if (bloomOn)
+    {
+        brightPass << <numBlocksPixels, blockSize1d >> > (dev_image, dev_bloomA, pixelcount, iter, rs.bloomThreshold);
+        float sigma = rs.bloomRadius / 3.0f;
+        blurPass << <blocksPerGrid2d, blockSize2d >> > (dev_bloomA, dev_bloomB, cam.resolution.x, cam.resolution.y, rs.bloomRadius, sigma, true);
+        blurPass << <blocksPerGrid2d, blockSize2d >> > (dev_bloomB, dev_bloomA, cam.resolution.x, cam.resolution.y, rs.bloomRadius, sigma, false);
+    }
+    sendImageToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, iter, dev_image, rs.toneMap,
+        bloomOn ? dev_bloomA : NULL, rs.bloomStrength);
 
     // Retrieve image from GPU
     cudaMemcpy(hst_scene->state.image.data(), dev_image,
         pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
+
+    if (bloomOn)
+        cudaMemcpy(hst_scene->state.bloom.data(), dev_bloomA,
+            pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
 
     checkCUDAError("pathtrace");
 }

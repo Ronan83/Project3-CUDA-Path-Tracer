@@ -103,6 +103,10 @@ struct RenderState
     std::vector<glm::vec3> image;
     std::string imageName;
     bool toneMap;
+    float bloomStrength = 0.0f;   // 0 = off
+    float bloomThreshold = 1.0f;  // linear radiance above which pixels glow
+    int bloomRadius = 24;         // blur radius in pixels
+    std::vector<glm::vec3> bloom; // host copy of the blurred glow, for saving
 };
 
 struct PathSegment

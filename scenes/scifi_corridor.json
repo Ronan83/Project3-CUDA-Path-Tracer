@@ -87,6 +87,9 @@
             1920,
             1080
         ],
+	"BLOOM": 0.3,
+	"BLOOM_THRESHOLD": 1.0,
+	"BLOOM_RADIUS": 32,
         "FOVY": 26.0,
         "ITERATIONS": 5000,
         "DEPTH": 10,

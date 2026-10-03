@@ -412,7 +412,10 @@ void saveImage()
         {
             int index = x + (y * width);
             glm::vec3 pix = renderState->image[index];
-            img.setPixel(width - 1 - x, y, toDisplay(glm::vec3(pix) / samples, renderState->toneMap));
+            glm::vec3 hdr = glm::vec3(pix) / samples;
+            if (renderState->bloomStrength > 0.0f && !renderState->bloom.empty())
+                hdr += renderState->bloomStrength * renderState->bloom[index];
+            img.setPixel(width - 1 - x, y, toDisplay(hdr, renderState->toneMap));
         }
     }
 

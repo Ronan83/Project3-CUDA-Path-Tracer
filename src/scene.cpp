@@ -169,6 +169,10 @@ void Scene::loadFromJSON(const std::string& jsonName)
 
     state.toneMap = cameraData.value("TONEMAP", false);
 
+    state.bloomStrength = cameraData.value("BLOOM", 0.0f);
+    state.bloomThreshold = cameraData.value("BLOOM_THRESHOLD", 1.0f);
+    state.bloomRadius = cameraData.value("BLOOM_RADIUS", 24);
+
     if (data.contains("Environment"))
     {
         const auto& env = data["Environment"];
