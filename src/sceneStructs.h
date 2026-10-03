@@ -90,6 +90,7 @@ struct RenderState
     int traceDepth;
     std::vector<glm::vec3> image;
     std::string imageName;
+    bool toneMap;
 };
 
 struct PathSegment
@@ -98,6 +99,7 @@ struct PathSegment
     glm::vec3 color;
     int pixelIndex;
     int remainingBounces;
+    float lastPdf;   // solid-angle pdf of last BSDF sample; <0 = delta/camera
 };
 
 // Use with a corresponding PathSegment to do:

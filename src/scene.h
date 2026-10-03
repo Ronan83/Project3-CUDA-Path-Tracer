@@ -17,5 +17,15 @@ public:
     std::vector<Material> materials;
     std::vector<Triangle> triangles;
     std::vector<BVHNode> bvhNodes;
+
+    // Equirectangular environment map (empty = black background)
+    std::vector<glm::vec3> envMap;
+    std::vector<float> envCdf;   // size w*h+1, normalized
+    int envWidth = 0;
+    int envHeight = 0;
+    float envIntensity = 1.0f;
+    float envRotation = 0.0f;   // radians
+
+
     RenderState state;
 };

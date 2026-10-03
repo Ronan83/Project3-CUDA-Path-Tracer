@@ -17,6 +17,8 @@
 #include "intersections.h"
 #include "interactions.h"
 
+#define ENV_NEE 1
+
 #define ERRORCHECK 1
 #define RUSSIAN_ROULETTE 1
 
@@ -58,7 +60,7 @@ thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int de
 }
 
 //Kernel that writes the image to the OpenGL PBO directly.
-__global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm::vec3* image)
+__global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm::vec3* image, bool toneMap)
 {
     int x = (blockIdx.x * blockDim.x) + threadIdx.x;
     int y = (blockIdx.y * blockDim.y) + threadIdx.y;
@@ -69,9 +71,10 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
         glm::vec3 pix = image[index];
 
         glm::ivec3 color;
-        color.x = glm::clamp((int)(pix.x / iter * 255.0), 0, 255);
-        color.y = glm::clamp((int)(pix.y / iter * 255.0), 0, 255);
-        color.z = glm::clamp((int)(pix.z / iter * 255.0), 0, 255);
+        glm::vec3 d = toDisplay(pix / (float)iter, toneMap);
+        color.x = (int)(d.x * 255.0f);
+        color.y = (int)(d.y * 255.0f);
+        color.z = (int)(d.z * 255.0f);
 
         // Each thread writes one pixel location in the texture (textel)
         pbo[index].w = 0;
@@ -91,6 +94,8 @@ static ShadeableIntersection* dev_intersections = NULL;
 static Triangle* dev_triangles = NULL;
 static BVHNode* dev_bvhNodes = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
+static glm::vec3* dev_envMap = NULL;
+static float* dev_envCdf = NULL;
 
 #if PROFILE
 static cudaEvent_t evStart = NULL, evStop = NULL;
@@ -154,6 +159,18 @@ void pathtraceInit(Scene* scene)
         cudaMemcpy(dev_bvhNodes, scene->bvhNodes.data(),
             scene->bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
     }
+    if (!scene->envMap.empty())
+    {
+        cudaMalloc(&dev_envMap, scene->envMap.size() * sizeof(glm::vec3));
+        cudaMemcpy(dev_envMap, scene->envMap.data(),
+            scene->envMap.size() * sizeof(glm::vec3), cudaMemcpyHostToDevice);
+    }
+    if (!scene->envCdf.empty())
+    {
+        cudaMalloc(&dev_envCdf, scene->envCdf.size() * sizeof(float));
+        cudaMemcpy(dev_envCdf, scene->envCdf.data(),
+            scene->envCdf.size() * sizeof(float), cudaMemcpyHostToDevice);
+    }
 
     #if PROFILE
         cudaEventCreate(&evStart);
@@ -173,6 +190,12 @@ void pathtraceFree()
     // TODO: clean up any extra device memory you created
     cudaFree(dev_triangles);
     cudaFree(dev_bvhNodes);
+
+    cudaFree(dev_envMap);
+    dev_envMap = NULL;
+
+    cudaFree(dev_envCdf);
+    dev_envCdf = NULL;
 
     #if PROFILE
     // pathtraceFree also runs before the first init, so guard against NULL
@@ -234,6 +257,8 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
+
+        segment.lastPdf = -1.0f;
     }
 }
 
@@ -368,13 +393,90 @@ __global__ void shadeFakeMaterial(
     }
 }
 
+// Look up the equirectangular environment map in direction dir
+__device__ glm::vec3 sampleEnvironment(const glm::vec3* env, int w, int h, float rotation, glm::vec3 dir)
+{
+    dir = glm::normalize(dir);
+    float phi = atan2f(dir.z, dir.x) + rotation;
+    float theta = acosf(glm::clamp(dir.y, -1.0f, 1.0f));
+    float u = phi / TWO_PI + 0.5f;
+    u -= floorf(u);
+    float v = theta / PI;
+    int x = min(w - 1, (int)(u * w));
+    int y = min(h - 1, (int)(v * h));
+    return env[y * w + x];
+}
+
+// Largest i with cdf[i] <= r
+__device__ int sampleEnvCdf(const float* cdf, int n, float r) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (cdf[mid] <= r) lo = mid; else hi = mid - 1;
+    }
+    return min(lo, n - 1);
+}
+
+// Importance-sample a direction; outputs solid-angle pdf
+__device__ glm::vec3 sampleEnvDirection(const float* cdf, int w, int h, float rotation,
+    thrust::default_random_engine& rng, float& pdf) {
+    thrust::uniform_real_distribution<float> u01(0, 1);
+    int idx = sampleEnvCdf(cdf, w * h, u01(rng));
+    float u = (idx % w + u01(rng)) / w;
+    float v = (idx / w + u01(rng)) / h;
+    float theta = v * PI;
+    float phi = (u - 0.5f) * TWO_PI - rotation;
+    float sinT = sinf(theta);
+    pdf = sinT > 1e-6f ? (cdf[idx + 1] - cdf[idx]) * w * h / (2.0f * PI * PI * sinT) : 0.0f;
+    return glm::vec3(sinT * cosf(phi), cosf(theta), sinT * sinf(phi));
+}
+
+// Pdf of sampleEnvDirection producing dir
+__device__ float envPdf(const float* cdf, int w, int h, float rotation, glm::vec3 dir) {
+    dir = glm::normalize(dir);
+    float phi = atan2f(dir.z, dir.x) + rotation;
+    float theta = acosf(glm::clamp(dir.y, -1.0f, 1.0f));
+    float u = phi / TWO_PI + 0.5f; u -= floorf(u);
+    int x = min(w - 1, (int)(u * w));
+    int y = min(h - 1, (int)(theta / PI * h));
+    int idx = y * w + x;
+    float sinT = sinf(theta);
+    return sinT > 1e-6f ? (cdf[idx + 1] - cdf[idx]) * w * h / (2.0f * PI * PI * sinT) : 0.0f;
+}
+
+// Env is at infinity: any hit means occluded
+__device__ bool isOccluded(Ray r, const Geom* geoms, int geomsSize,
+    const Triangle* tris, const BVHNode* nodes) {
+    glm::vec3 p, nrm; bool outside;
+    for (int i = 0; i < geomsSize; ++i) {
+        const Geom& g = geoms[i];
+        float t = -1.0f;
+        if (g.type == CUBE) t = boxIntersectionTest(g, r, p, nrm, outside);
+        else if (g.type == SPHERE) t = sphereIntersectionTest(g, r, p, nrm, outside);
+        else if (g.type == MESH) t = meshIntersectionTest(g, tris, nodes, r, p, nrm, outside);
+        if (t > 0.0f) return true;
+    }
+    return false;
+}
+
 __global__ void shadeMaterial(
     int iter,
     int depth,
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
-    Material* materials)
+    Material* materials,
+    const glm::vec3* envMap,
+    int envWidth,
+    int envHeight,
+    float envIntensity,
+    float envRotation,
+    const float* envCdf,
+    const Geom* geoms,
+    int geomsSize,
+    const Triangle* tris,
+    const BVHNode* nodes,
+    glm::vec3* image)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths) return;
@@ -385,7 +487,21 @@ __global__ void shadeMaterial(
     ShadeableIntersection isect = shadeableIntersections[idx];
 
     if (isect.t <= 0.0f) {
-        seg.color = glm::vec3(0.0f);
+        // Escaped the scene: pick up light from the environment map, or black if there is none
+        if (envMap != NULL) {
+            glm::vec3 Le = envIntensity * sampleEnvironment(envMap, envWidth, envHeight, envRotation, seg.ray.direction);
+#if ENV_NEE
+            // MIS weight for BSDF-sampled hits on the env
+            float pb = seg.lastPdf;
+            if (envCdf != NULL && pb > 0.0f) {
+                float pl = envPdf(envCdf, envWidth, envHeight, envRotation, seg.ray.direction);
+                Le *= pb * pb / (pb * pb + pl * pl);
+            }
+#endif
+            seg.color *= Le;
+        }
+        else
+            seg.color = glm::vec3(0.0f);
         seg.remainingBounces = 0;
         return;
     }
@@ -400,6 +516,30 @@ __global__ void shadeMaterial(
 
     thrust::default_random_engine rng = makeSeededRandomEngine(iter, idx, seg.remainingBounces);
     glm::vec3 hitPoint = getPointOnRay(seg.ray, isect.t);
+
+#if ENV_NEE
+    // Next event estimation toward the env map (diffuse only)
+    if (envCdf != NULL && m.hasReflective == 0.0f && m.hasRefractive == 0.0f) {
+        glm::vec3 nrm = isect.surfaceNormal;
+        if (glm::dot(seg.ray.direction, nrm) > 0.0f) nrm = -nrm;
+        float pl;
+        glm::vec3 wi = sampleEnvDirection(envCdf, envWidth, envHeight, envRotation, rng, pl);
+        float cosT = glm::dot(wi, nrm);
+        if (pl > 0.0f && cosT > 0.0f) {
+            Ray shadow;
+            shadow.origin = hitPoint + nrm * 0.001f;
+            shadow.direction = wi;
+            if (!isOccluded(shadow, geoms, geomsSize, tris, nodes)) {
+                float pb = cosT / PI;
+                float w = pl * pl / (pl * pl + pb * pb);   // power heuristic
+                glm::vec3 Le = envIntensity * sampleEnvironment(envMap, envWidth, envHeight, envRotation, wi);
+                // One path per pixel per iteration, so no race here
+                image[seg.pixelIndex] += seg.color * m.color * Le * (cosT / PI) * (w / pl);
+            }
+        }
+    }
+#endif
+
     scatterRay(seg, hitPoint, isect.surfaceNormal, isect.outside, m, rng);
     seg.remainingBounces--;
 
@@ -562,7 +702,18 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             num_paths,
             dev_intersections,
             dev_paths,
-            dev_materials
+            dev_materials,
+            dev_envMap,
+            hst_scene->envWidth,
+            hst_scene->envHeight,
+            hst_scene->envIntensity,
+            hst_scene->envRotation,
+            dev_envCdf,
+            dev_geoms,
+            (int)hst_scene->geoms.size(),
+            dev_triangles,
+            dev_bvhNodes,
+            dev_image
             );
         PROFILE_END(timeShade);
 
@@ -606,7 +757,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     ///////////////////////////////////////////////////////////////////////////
 
     // Send results to OpenGL buffer for rendering
-    sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, dev_image);
+    sendImageToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, iter, dev_image, hst_scene->state.toneMap);
 
     // Retrieve image from GPU
     cudaMemcpy(hst_scene->state.image.data(), dev_image,

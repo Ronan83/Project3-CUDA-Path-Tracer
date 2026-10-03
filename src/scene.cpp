@@ -5,6 +5,7 @@
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtx/string_cast.hpp>
 #include "json.hpp"
+#include <stb_image.h>
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
@@ -138,6 +139,50 @@ void Scene::loadFromJSON(const std::string& jsonName)
     camera.up = glm::vec3(up[0], up[1], up[2]);
     camera.lensRadius = cameraData.value("LENS_RADIUS", 0.0f);
     camera.focalDistance = cameraData.value("FOCAL_DISTANCE", 10.0f);
+
+    state.toneMap = cameraData.value("TONEMAP", false);
+
+    if (data.contains("Environment"))
+    {
+        const auto& env = data["Environment"];
+        std::string baseDir = jsonName.substr(0, jsonName.find_last_of("/\\") + 1);
+        std::string path = baseDir + env["FILE"].get<std::string>();
+        int channels = 0;
+        float* pixels = stbi_loadf(path.c_str(), &envWidth, &envHeight, &channels, 3);
+        if (!pixels)
+        {
+            cerr << "Failed to load environment map " << path << endl;
+            exit(-1);
+        }
+        envMap.assign((glm::vec3*)pixels, (glm::vec3*)pixels + envWidth * envHeight);
+        stbi_image_free(pixels);
+        envIntensity = env.value("INTENSITY", 1.0f);
+        envRotation = env.value("ROTATION", 0.0f) * PI / 180.0f;
+        cout << "Loaded environment map " << path << ": " << envWidth << "x" << envHeight << endl;
+
+        // 1D CDF over env pixels, weight = luminance * sin(theta)
+        int n = envWidth * envHeight;
+        std::vector<double> acc(n + 1, 0.0);
+        for (int y = 0; y < envHeight; ++y) {
+            double sinT = sin(PI * (y + 0.5) / envHeight);
+            for (int x = 0; x < envWidth; ++x) {
+                const glm::vec3& c = envMap[y * envWidth + x];
+                double lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+                acc[y * envWidth + x + 1] = acc[y * envWidth + x] + lum * sinT;
+            }
+        }
+        envCdf.resize(n + 1);
+        for (int i = 0; i <= n; ++i) envCdf[i] = (float)(acc[i] / acc[n]);
+        envCdf[n] = 1.0f;
+
+        // Debug: brightest pixel and its probability
+        int maxI = 0; float maxP = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            float p = envCdf[i + 1] - envCdf[i];
+            if (p > maxP) { maxP = p; maxI = i; }
+        }
+        printf("env CDF built: max pixel (%d, %d) prob %.6f\n", maxI % envWidth, maxI / envWidth, maxP);
+    }
 
     //calculate fov based on resolution
     float yscaled = tan(fovy * (PI / 180));

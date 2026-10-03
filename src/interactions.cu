@@ -76,14 +76,17 @@ __host__ __device__ void scatterRay(
             pathSegment.ray.origin = intersect - n * 0.001f;
         }
         pathSegment.color *= m.specular.color;
+        pathSegment.lastPdf = -1.0f;
     }
     else if (m.hasReflective > 0.0f) {
         pathSegment.ray.direction = glm::reflect(wi, n);
         pathSegment.ray.origin = intersect + n * 0.001f;
         pathSegment.color *= m.specular.color;
+        pathSegment.lastPdf = -1.0f;
     }
     else {
         pathSegment.ray.direction = calculateRandomDirectionInHemisphere(n, rng);
+        pathSegment.lastPdf = glm::dot(pathSegment.ray.direction, n) / PI;
         pathSegment.ray.origin = intersect + n * 0.001f;
         pathSegment.color *= m.color;
     }
