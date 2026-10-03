@@ -56,6 +56,13 @@ struct Geom
     int bvhRoot;
 };
 
+struct TextureInfo
+{
+    int offset;   // first pixel in the packed texture array
+    int width;
+    int height;
+};
+
 struct Material
 {
     glm::vec3 color;
@@ -70,6 +77,7 @@ struct Material
     float emittance;
     float roughness;   // GGX roughness, 0 = perfect mirror
     float metallic;    // 1 = metal (F0 = color), 0 = glossy coat over diffuse
+    int texId;    // -1 = no texture
 };
 
 struct Camera

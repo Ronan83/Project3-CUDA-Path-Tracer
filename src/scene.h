@@ -2,6 +2,7 @@
 
 #include "sceneStructs.h"
 #include <vector>
+#include <unordered_map>
 
 class Scene
 {
@@ -21,6 +22,12 @@ public:
     // Equirectangular environment map (empty = black background)
     std::vector<glm::vec3> envMap;
     std::vector<float> envCdf;   // size w*h+1, normalized
+
+    std::vector<glm::vec3> texPixels;     // all textures packed, linear RGB
+    std::vector<TextureInfo> textures;
+    std::unordered_map<std::string, int> texCache;
+    int loadTexture(const std::string& path);
+
     int envWidth = 0;
     int envHeight = 0;
     float envIntensity = 1.0f;

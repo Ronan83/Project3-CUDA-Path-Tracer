@@ -96,6 +96,8 @@ static BVHNode* dev_bvhNodes = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 static glm::vec3* dev_envMap = NULL;
 static float* dev_envCdf = NULL;
+static glm::vec3* dev_texPixels = NULL;
+static TextureInfo* dev_texInfo = NULL;
 
 #if PROFILE
 static cudaEvent_t evStart = NULL, evStop = NULL;
@@ -172,6 +174,16 @@ void pathtraceInit(Scene* scene)
             scene->envCdf.size() * sizeof(float), cudaMemcpyHostToDevice);
     }
 
+    if (!scene->textures.empty())
+    {
+        cudaMalloc(&dev_texPixels, scene->texPixels.size() * sizeof(glm::vec3));
+        cudaMemcpy(dev_texPixels, scene->texPixels.data(),
+            scene->texPixels.size() * sizeof(glm::vec3), cudaMemcpyHostToDevice);
+        cudaMalloc(&dev_texInfo, scene->textures.size() * sizeof(TextureInfo));
+        cudaMemcpy(dev_texInfo, scene->textures.data(),
+            scene->textures.size() * sizeof(TextureInfo), cudaMemcpyHostToDevice);
+    }
+
     #if PROFILE
         cudaEventCreate(&evStart);
         cudaEventCreate(&evStop);
@@ -190,6 +202,9 @@ void pathtraceFree()
     // TODO: clean up any extra device memory you created
     cudaFree(dev_triangles);
     cudaFree(dev_bvhNodes);
+
+    cudaFree(dev_texPixels); dev_texPixels = NULL;
+    cudaFree(dev_texInfo);   dev_texInfo = NULL;
 
     cudaFree(dev_envMap);
     dev_envMap = NULL;
@@ -410,6 +425,22 @@ __device__ glm::vec3 sampleEnvironment(const glm::vec3* env, int w, int h, float
     return env[y * w + x];
 }
 
+// Bilinear texture lookup with repeat wrapping
+__device__ glm::vec3 sampleTexture(const glm::vec3* pix, TextureInfo t, glm::vec2 uv)
+{
+    float u = uv.x - floorf(uv.x), v = uv.y - floorf(uv.y);
+    float fx = u * t.width - 0.5f;
+    float fy = (1.0f - v) * t.height - 0.5f;   // OBJ v points up, image rows go down
+    int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+    float tx = fx - x0, ty = fy - y0;
+    int x1 = (x0 + 1) % t.width;  x0 = (x0 + t.width) % t.width;
+    int y1 = (y0 + 1) % t.height; y0 = (y0 + t.height) % t.height;
+    const glm::vec3* p = pix + t.offset;
+    glm::vec3 a = glm::mix(p[y0 * t.width + x0], p[y0 * t.width + x1], tx);
+    glm::vec3 b = glm::mix(p[y1 * t.width + x0], p[y1 * t.width + x1], tx);
+    return glm::mix(a, b, ty);
+}
+
 // Largest i with cdf[i] <= r
 __device__ int sampleEnvCdf(const float* cdf, int n, float r) {
     int lo = 0, hi = n;
@@ -480,7 +511,9 @@ __global__ void shadeMaterial(
     int geomsSize,
     const Triangle* tris,
     const BVHNode* nodes,
-    glm::vec3* image)
+    glm::vec3* image,
+    const glm::vec3* texPixels,
+    const TextureInfo* texInfo)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths) return;
@@ -511,6 +544,8 @@ __global__ void shadeMaterial(
     }
 
     Material m = materials[isect.materialId];
+
+    if (m.texId >= 0) m.color *= sampleTexture(texPixels, texInfo[m.texId], isect.uv);
 
     if (m.emittance > 0.0f) {
         seg.color *= m.color * m.emittance;
@@ -592,7 +627,10 @@ __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iteration
     if (index < nPaths)
     {
         PathSegment iterationPath = iterationPaths[index];
-        image[iterationPath.pixelIndex] += iterationPath.color;
+        glm::vec3 c = iterationPath.color;
+        // Drop NaN/Inf samples so a single bad path cannot stain a pixel
+        if (isfinite(c.x) && isfinite(c.y) && isfinite(c.z))
+            image[iterationPath.pixelIndex] += c;
     }
 }
 
@@ -717,7 +755,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             (int)hst_scene->geoms.size(),
             dev_triangles,
             dev_bvhNodes,
-            dev_image
+            dev_image,
+            dev_texPixels,
+            dev_texInfo
             );
         PROFILE_END(timeShade);
 

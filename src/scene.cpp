@@ -88,6 +88,14 @@ void Scene::loadFromJSON(const std::string& jsonName)
             newMaterial.roughness = p.value("ROUGHNESS", 0.2f);
             newMaterial.metallic = (p["TYPE"] == "Metal") ? 1.0f : 0.0f;
         }
+
+        newMaterial.texId = -1;
+        if (p.contains("TEXTURE"))
+        {
+            std::string baseDir = jsonName.substr(0, jsonName.find_last_of("/\\") + 1);
+            newMaterial.texId = loadTexture(baseDir + p["TEXTURE"].get<std::string>());
+        }
+
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
     }
@@ -574,4 +582,32 @@ void Scene::buildBVHNode(int nodeIdx, int first, int count, int depth)
 
     buildBVHNode(left, first, leftCount, depth + 1);
     buildBVHNode(left + 1, first + leftCount, count - leftCount, depth + 1);
+}
+
+int Scene::loadTexture(const std::string& path)
+{
+    auto it = texCache.find(path);
+    if (it != texCache.end()) return it->second;   // same file shared by several materials
+
+    int w, h, c;
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &c, 3);
+    if (!data)
+    {
+        cerr << "Failed to load texture " << path << endl;
+        exit(-1);
+    }
+    TextureInfo info{ (int)texPixels.size(), w, h };
+    texPixels.reserve(texPixels.size() + (size_t)w * h);
+    for (int i = 0; i < w * h; i++)
+    {
+        glm::vec3 s(data[3 * i], data[3 * i + 1], data[3 * i + 2]);
+        texPixels.push_back(glm::pow(s / 255.0f, glm::vec3(2.2f)));   // sRGB -> linear
+    }
+    stbi_image_free(data);
+
+    int id = (int)textures.size();
+    textures.push_back(info);
+    texCache[path] = id;
+    cout << "Loaded texture " << path << ": " << w << "x" << h << endl;
+    return id;
 }
