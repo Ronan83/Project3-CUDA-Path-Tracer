@@ -23,6 +23,8 @@ public:
     std::vector<glm::vec3> envMap;
     std::vector<float> envCdf;   // size w*h+1, normalized
 
+    std::vector<int> lights;   // indices of emissive cube/sphere geoms
+
     std::vector<glm::vec3> texPixels;     // all textures packed, linear RGB
     std::vector<TextureInfo> textures;
     std::unordered_map<std::string, int> texCache;

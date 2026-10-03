@@ -18,6 +18,7 @@
 #include "interactions.h"
 
 #define ENV_NEE 1
+#define LIGHT_NEE 0
 
 #define ERRORCHECK 1
 #define RUSSIAN_ROULETTE 1
@@ -98,6 +99,7 @@ static glm::vec3* dev_envMap = NULL;
 static float* dev_envCdf = NULL;
 static glm::vec3* dev_texPixels = NULL;
 static TextureInfo* dev_texInfo = NULL;
+static int* dev_lights = NULL;
 
 #if PROFILE
 static cudaEvent_t evStart = NULL, evStop = NULL;
@@ -184,6 +186,13 @@ void pathtraceInit(Scene* scene)
             scene->textures.size() * sizeof(TextureInfo), cudaMemcpyHostToDevice);
     }
 
+    if (!scene->lights.empty())
+    {
+        cudaMalloc(&dev_lights, scene->lights.size() * sizeof(int));
+        cudaMemcpy(dev_lights, scene->lights.data(),
+            scene->lights.size() * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
     #if PROFILE
         cudaEventCreate(&evStart);
         cudaEventCreate(&evStop);
@@ -205,6 +214,7 @@ void pathtraceFree()
 
     cudaFree(dev_texPixels); dev_texPixels = NULL;
     cudaFree(dev_texInfo);   dev_texInfo = NULL;
+    cudaFree(dev_lights);    dev_lights = NULL;
 
     cudaFree(dev_envMap);
     dev_envMap = NULL;
@@ -353,6 +363,7 @@ __global__ void computeIntersections(
             intersections[path_index].surfaceNormal = normal;
             intersections[path_index].outside = hit_outside;
             intersections[path_index].uv = uv;
+            intersections[path_index].geomId = hit_geom_index;
         }
     }
 }
@@ -478,9 +489,9 @@ __device__ float envPdf(const float* cdf, int w, int h, float rotation, glm::vec
     return sinT > 1e-6f ? (cdf[idx + 1] - cdf[idx]) * w * h / (2.0f * PI * PI * sinT) : 0.0f;
 }
 
-// Env is at infinity: any hit means occluded
+// True if anything blocks the ray before distance maxT
 __device__ bool isOccluded(Ray r, const Geom* geoms, int geomsSize,
-    const Triangle* tris, const BVHNode* nodes) {
+    const Triangle* tris, const BVHNode* nodes, float maxT) {
     glm::vec3 p, nrm; bool outside;
     glm::vec2 uvDummy;
     for (int i = 0; i < geomsSize; ++i) {
@@ -489,10 +500,39 @@ __device__ bool isOccluded(Ray r, const Geom* geoms, int geomsSize,
         if (g.type == CUBE) t = boxIntersectionTest(g, r, p, nrm, outside);
         else if (g.type == SPHERE) t = sphereIntersectionTest(g, r, p, nrm, outside);
         else if (g.type == MESH) t = meshIntersectionTest(g, tris, nodes, r, p, nrm, outside, uvDummy);
-        if (t > 0.0f) return true;
+        if (t > 0.0f && t < maxT) return true;
     }
     return false;
 }
+
+// Uniformly sample a point on a cube or sphere light (by area)
+__device__ void sampleLightPoint(const Geom& g, thrust::default_random_engine& rng,
+    glm::vec3& p, glm::vec3& n) {
+    thrust::uniform_real_distribution<float> u01(0, 1);
+    float a = u01(rng) - 0.5f, b = u01(rng) - 0.5f;
+    glm::vec3 lp, ln;
+    if (g.type == CUBE) {
+        // Pick a face with probability proportional to its area
+        glm::vec3 s = g.scale;
+        float ax = s.y * s.z, ay = s.x * s.z, az = s.x * s.y;
+        float r = u01(rng) * (ax + ay + az);
+        float side = u01(rng) < 0.5f ? -0.5f : 0.5f;
+        if (r < ax) { lp = glm::vec3(side, a, b); ln = glm::vec3(side, 0, 0); }
+        else if (r < ax + ay) { lp = glm::vec3(a, side, b); ln = glm::vec3(0, side, 0); }
+        else { lp = glm::vec3(a, b, side); ln = glm::vec3(0, 0, side); }
+    }
+    else {
+        // Uniform point on the unit sphere, radius 0.5 in object space
+        float z = 1.0f - 2.0f * u01(rng);
+        float rr = sqrtf(fmaxf(0.0f, 1.0f - z * z));
+        float phi = TWO_PI * u01(rng);
+        ln = glm::vec3(rr * cosf(phi), rr * sinf(phi), z);
+        lp = 0.5f * ln;
+    }
+    p = glm::vec3(g.transform * glm::vec4(lp, 1.0f));
+    n = glm::normalize(glm::vec3(g.invTranspose * glm::vec4(ln, 0.0f)));
+}
+
 
 __global__ void shadeMaterial(
     int iter,
@@ -513,7 +553,9 @@ __global__ void shadeMaterial(
     const BVHNode* nodes,
     glm::vec3* image,
     const glm::vec3* texPixels,
-    const TextureInfo* texInfo)
+    const TextureInfo* texInfo,
+    const int* lights,
+    int numLights)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths) return;
@@ -548,7 +590,18 @@ __global__ void shadeMaterial(
     if (m.texId >= 0) m.color *= sampleTexture(texPixels, texInfo[m.texId], isect.uv);
 
     if (m.emittance > 0.0f) {
-        seg.color *= m.color * m.emittance;
+        glm::vec3 Le = m.color * m.emittance;
+#if LIGHT_NEE
+        // MIS weight for BSDF-sampled hits on a light
+        float pb = seg.lastPdf;
+        const Geom& g = geoms[isect.geomId];
+        if (numLights > 0 && pb > 0.0f && g.type != MESH) {
+            float cosL = fabsf(glm::dot(isect.surfaceNormal, glm::normalize(seg.ray.direction)));
+            float pl = isect.t * isect.t / (fmaxf(cosL, 1e-6f) * g.area * numLights);
+            Le *= pb * pb / (pb * pb + pl * pl);
+        }
+#endif
+        seg.color *= Le;
         seg.remainingBounces = 0;
         return;
     }
@@ -568,12 +621,44 @@ __global__ void shadeMaterial(
             Ray shadow;
             shadow.origin = hitPoint + nrm * 0.001f;
             shadow.direction = wi;
-            if (!isOccluded(shadow, geoms, geomsSize, tris, nodes)) {
+            if (!isOccluded(shadow, geoms, geomsSize, tris, nodes, FLT_MAX)) {
                 float pb = cosT / PI;
                 float w = pl * pl / (pl * pl + pb * pb);   // power heuristic
                 glm::vec3 Le = envIntensity * sampleEnvironment(envMap, envWidth, envHeight, envRotation, wi);
                 // One path per pixel per iteration, so no race here
                 image[seg.pixelIndex] += seg.color * m.color * Le * (cosT / PI) * (w / pl);
+            }
+        }
+    }
+#endif
+
+#if LIGHT_NEE
+    // Next event estimation toward a random area light (diffuse only)
+    if (numLights > 0 && m.hasReflective == 0.0f && m.hasRefractive == 0.0f) {
+        thrust::uniform_real_distribution<float> u01(0, 1);
+        glm::vec3 nrm = isect.surfaceNormal;
+        if (glm::dot(seg.ray.direction, nrm) > 0.0f) nrm = -nrm;
+
+        const Geom& L = geoms[lights[min((int)(u01(rng) * numLights), numLights - 1)]];
+        glm::vec3 lp, ln;
+        sampleLightPoint(L, rng, lp, ln);
+        glm::vec3 d = lp - hitPoint;
+        float dist2 = glm::dot(d, d);
+        float dist = sqrtf(dist2);
+        glm::vec3 wi = d / dist;
+        float cosS = glm::dot(wi, nrm);
+        float cosL = -glm::dot(wi, ln);
+        if (cosS > 0.0f && cosL > 0.0f) {
+            Ray shadow;
+            shadow.origin = hitPoint + nrm * 0.001f;
+            shadow.direction = wi;
+            if (!isOccluded(shadow, geoms, geomsSize, tris, nodes, dist - 0.01f)) {
+                // Area pdf -> solid angle: dist^2 / (cosL * area), times 1/numLights
+                float pl = dist2 / (cosL * L.area * numLights);
+                float pb = cosS / PI;
+                float w = pl * pl / (pl * pl + pb * pb);
+                const Material& lm = materials[L.materialid];
+                image[seg.pixelIndex] += seg.color * m.color * (lm.color * lm.emittance) * (cosS / PI) * (w / pl);
             }
         }
     }
@@ -757,7 +842,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_bvhNodes,
             dev_image,
             dev_texPixels,
-            dev_texInfo
+            dev_texInfo,
+            dev_lights,
+            (int)hst_scene->lights.size()
             );
         PROFILE_END(timeShade);
 

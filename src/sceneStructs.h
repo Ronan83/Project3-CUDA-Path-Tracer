@@ -54,6 +54,7 @@ struct Geom
     glm::vec3 bboxMin;
     glm::vec3 bboxMax;
     int bvhRoot;
+    float area;
 };
 
 struct TextureInfo
@@ -123,4 +124,5 @@ struct ShadeableIntersection
   int materialId;
   bool outside;
   glm::vec2 uv;
+  int geomId;
 };

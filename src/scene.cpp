@@ -137,9 +137,18 @@ void Scene::loadFromJSON(const std::string& jsonName)
             loadOBJ(baseDir + p["FILE"].get<std::string>(), newGeom);
         }
 
+        // Area for light sampling (sphere assumes uniform scale)
+        glm::vec3 s = newGeom.scale;
+        if (newGeom.type == CUBE) newGeom.area = 2.0f * (s.x * s.y + s.y * s.z + s.z * s.x);
+        else if (newGeom.type == SPHERE) newGeom.area = PI * s.x * s.x;
+        else newGeom.area = 0.0f;
+        if (newGeom.type != MESH && materials[newGeom.materialid].emittance > 0.0f)
+            lights.push_back((int)geoms.size());
 
         geoms.push_back(newGeom);
     }
+    cout << "Lights: " << lights.size() << endl;
+
     const auto& cameraData = data["Camera"];
     Camera& camera = state.camera;
     RenderState& state = this->state;
