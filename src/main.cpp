@@ -380,8 +380,10 @@ int main(int argc, char** argv)
     // so, (0 0 1) is forward, (0 1 0) is up
     glm::vec3 viewXZ = glm::vec3(view.x, 0.0f, view.z);
     glm::vec3 viewZY = glm::vec3(0.0f, view.y, view.z);
-    phi = glm::acos(glm::dot(glm::normalize(viewXZ), glm::vec3(0, 0, -1)));
-    theta = glm::acos(glm::dot(glm::normalize(viewZY), glm::vec3(0, 1, 0)));
+    // Orbit angles from the eye's offset to the look-at point (base code mirrored pitch/yaw)
+    glm::vec3 offset = cam.position - cam.lookAt;
+    theta = glm::acos(glm::clamp(offset.y / glm::length(offset), -1.0f, 1.0f));
+    phi = atan2f(offset.x, offset.z);
     ogLookAt = cam.lookAt;
     zoom = glm::length(cam.position - ogLookAt);
 

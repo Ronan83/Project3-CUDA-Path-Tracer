@@ -67,6 +67,8 @@ struct Material
     float hasRefractive;
     float indexOfRefraction;
     float emittance;
+    float roughness;   // GGX roughness, 0 = perfect mirror
+    float metallic;    // 1 = metal (F0 = color), 0 = glossy coat over diffuse
 };
 
 struct Camera
