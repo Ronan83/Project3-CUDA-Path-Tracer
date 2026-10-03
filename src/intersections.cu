@@ -169,7 +169,8 @@ __host__ __device__ float meshIntersectionTest(
     Ray r,
     glm::vec3& intersectionPoint,
     glm::vec3& normal,
-    bool& outside)
+    bool& outside,
+    glm::vec2& uv)
 {
     float tMin = FLT_MAX;
     int hit = -1;   // absolute triangle index
@@ -250,6 +251,7 @@ __host__ __device__ float meshIntersectionTest(
 
     // Smooth shading normal from the vertex normals
     glm::vec3 n = glm::normalize((1.0f - hitU - hitV) * tri.n0 + hitU * tri.n1 + hitV * tri.n2);
+    uv = (1.0f - hitU - hitV) * tri.t0 + hitU * tri.t1 + hitV * tri.t2;
 
     // Geometric normal (winding order) decides inside vs outside
     glm::vec3 geoN = glm::cross(tri.v1 - tri.v0, tri.v2 - tri.v0);

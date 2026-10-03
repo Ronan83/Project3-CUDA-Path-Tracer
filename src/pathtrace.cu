@@ -292,6 +292,7 @@ __global__ void computeIntersections(
 
         glm::vec3 tmp_intersect;
         glm::vec3 tmp_normal;
+        glm::vec2 tmp_uv(0.0f), uv(0.0f);
 
         // naive parse through global geoms
 
@@ -310,7 +311,7 @@ __global__ void computeIntersections(
             // TODO: add more intersection tests here... triangle? metaball? CSG?
             else if (geom.type == MESH)
             {
-                t = meshIntersectionTest(geom, triangles, bvhNodes, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                t = meshIntersectionTest(geom, triangles, bvhNodes, pathSegment.ray, tmp_intersect, tmp_normal, outside, tmp_uv);
             }
             // Compute the minimum t from the intersection tests to determine what
             // scene geometry object was hit first.
@@ -321,6 +322,7 @@ __global__ void computeIntersections(
                 hit_outside = outside;
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
+                uv = (geom.type == MESH) ? tmp_uv : glm::vec2(0.0f);
             }
         }
 
@@ -335,6 +337,7 @@ __global__ void computeIntersections(
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
             intersections[path_index].surfaceNormal = normal;
             intersections[path_index].outside = hit_outside;
+            intersections[path_index].uv = uv;
         }
     }
 }
@@ -448,12 +451,13 @@ __device__ float envPdf(const float* cdf, int w, int h, float rotation, glm::vec
 __device__ bool isOccluded(Ray r, const Geom* geoms, int geomsSize,
     const Triangle* tris, const BVHNode* nodes) {
     glm::vec3 p, nrm; bool outside;
+    glm::vec2 uvDummy;
     for (int i = 0; i < geomsSize; ++i) {
         const Geom& g = geoms[i];
         float t = -1.0f;
         if (g.type == CUBE) t = boxIntersectionTest(g, r, p, nrm, outside);
         else if (g.type == SPHERE) t = sphereIntersectionTest(g, r, p, nrm, outside);
-        else if (g.type == MESH) t = meshIntersectionTest(g, tris, nodes, r, p, nrm, outside);
+        else if (g.type == MESH) t = meshIntersectionTest(g, tris, nodes, r, p, nrm, outside, uvDummy);
         if (t > 0.0f) return true;
     }
     return false;

@@ -20,6 +20,7 @@ struct Triangle
 {
     glm::vec3 v0, v1, v2;   
     glm::vec3 n0, n1, n2;   
+    glm::vec2 t0, t1, t2;   // texture coordinates
 };
 
 
@@ -113,4 +114,5 @@ struct ShadeableIntersection
   glm::vec3 surfaceNormal;
   int materialId;
   bool outside;
+  glm::vec2 uv;
 };

@@ -238,6 +238,7 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
         for (size_t f = 0; f + 2 < idx.size(); f += 3)
         {
             glm::vec3 v[3], n[3];
+            glm::vec2 uv[3];
             bool hasNormals = true;
             for (int k = 0; k < 3; k++)
             {
@@ -246,6 +247,10 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
                     attrib.vertices[3 * id.vertex_index + 1],
                     attrib.vertices[3 * id.vertex_index + 2]);
                 v[k] = glm::vec3(geom.transform * glm::vec4(pos, 1.0f));   // chenge to world coordinate
+
+                uv[k] = id.texcoord_index >= 0
+                    ? glm::vec2(attrib.texcoords[2 * id.texcoord_index], attrib.texcoords[2 * id.texcoord_index + 1])
+                    : glm::vec2(0.0f);
 
                 if (id.normal_index >= 0)
                 {
@@ -270,6 +275,7 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
             Triangle tri;
             tri.v0 = v[0]; tri.v1 = v[1]; tri.v2 = v[2];
             tri.n0 = n[0]; tri.n1 = n[1]; tri.n2 = n[2];
+            tri.t0 = uv[0]; tri.t1 = uv[1]; tri.t2 = uv[2];
             triangles.push_back(tri);
 
             for (int k = 0; k < 3; k++)
