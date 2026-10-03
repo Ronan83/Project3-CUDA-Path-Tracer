@@ -17,8 +17,10 @@
 #include "intersections.h"
 #include "interactions.h"
 
+__device__ int d_badRays;   // diagnostic: rays with non-finite origin/direction
+
 #define ENV_NEE 1
-#define LIGHT_NEE 0
+#define LIGHT_NEE 1
 
 #define ERRORCHECK 1
 #define RUSSIAN_ROULETTE 1
@@ -306,6 +308,18 @@ __global__ void computeIntersections(
     if (path_index < num_paths)
     {
         PathSegment pathSegment = pathSegments[path_index];
+
+        // Guard: a NaN/Inf ray would visit every BVH node, so drop it here
+        const Ray& rr = pathSegment.ray;
+        if (!isfinite(rr.origin.x) || !isfinite(rr.origin.y) || !isfinite(rr.origin.z) ||
+            !isfinite(rr.direction.x) || !isfinite(rr.direction.y) || !isfinite(rr.direction.z))
+        {
+            atomicAdd(&d_badRays, 1);
+            intersections[path_index].t = -1.0f;
+            pathSegments[path_index].color = glm::vec3(0.0f);
+            pathSegments[path_index].remainingBounces = 0;
+            return;
+        }
 
         float t;
         glm::vec3 intersect_point;
@@ -788,6 +802,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     {
         printf("--- alive paths per bounce (iter %d, compaction %s) ---\n",
             iter, STREAM_COMPACTION ? "on" : "off");
+        int zero = 0;
+        cudaMemcpyToSymbol(d_badRays, &zero, sizeof(int));
     }
 
     bool iterationComplete = false;
@@ -809,7 +825,19 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_bvhNodes,
             dev_intersections
             );
-        PROFILE_END(timeIntersect);
+#if PROFILE
+        {
+            float ms = elapsedMs();
+            timeIntersect += ms;
+            if (logBounces)
+            {
+                int bad = 0, zero = 0;
+                cudaMemcpyFromSymbol(&bad, d_badRays, sizeof(int));
+                cudaMemcpyToSymbol(d_badRays, &zero, sizeof(int));
+                printf("  intersect @ bounce %d: %.3f ms for %d paths, %d bad rays\n", depth, ms, num_paths, bad);
+            }
+        }
+#endif
         checkCUDAError("trace one bounce");
         depth++;
 

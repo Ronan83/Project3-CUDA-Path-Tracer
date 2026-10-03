@@ -3,9 +3,11 @@
         "floor": {"TYPE": "Diffuse", "RGB": [0.3, 0.3, 0.32]},
         "glass": {"TYPE": "Refractive", "RGB": [0.98, 0.98, 0.98], "IOR": 1.5},
         "chrome": {"TYPE": "Specular", "RGB": [0.95, 0.95, 0.95]}
+
+
     },
     "Environment": {
-   "FILE": "hdr/venice_sunset_2k.hdr",
+   "FILE": "hdr/venice_sunset_8k.hdr",
    "INTENSITY": 0.5,
    "ROTATION": 110
     },

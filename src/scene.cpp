@@ -249,6 +249,8 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
     geom.bboxMin = glm::vec3(FLT_MAX);
     geom.bboxMax = glm::vec3(-FLT_MAX);
 
+    int badNormals = 0;
+
     for (const auto& shape : shapes)
     {
         const auto& idx = shape.mesh.indices;  
@@ -289,6 +291,16 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
                 n[0] = n[1] = n[2] = glm::normalize(faceN);
             }
 
+            // Replace NaN/degenerate vertex normals with the face normal
+            for (int k = 0; k < 3; k++)
+            {
+                if (!std::isfinite(n[k].x) || !std::isfinite(n[k].y) || !std::isfinite(n[k].z))
+                {
+                    n[k] = glm::normalize(faceN);
+                    badNormals++;
+                }
+            }
+
             Triangle tri;
             tri.v0 = v[0]; tri.v1 = v[1]; tri.v2 = v[2];
             tri.n0 = n[0]; tri.n1 = n[1]; tri.n2 = n[2];
@@ -305,6 +317,7 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
 
     geom.triCount = (int)triangles.size() - geom.triStart;
     cout << "Loaded " << path << ": " << geom.triCount << " triangles" << endl;
+    cout << "  bad vertex normals fixed: " << badNormals << endl;
 
 
     auto t0 = std::chrono::high_resolution_clock::now();

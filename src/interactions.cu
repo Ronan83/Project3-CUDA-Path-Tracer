@@ -92,8 +92,11 @@ __host__ __device__ void scatterRay(
 
         float ior = m.indexOfRefraction;
         float eta = outside ? (1.0f / ior) : ior;
-        glm::vec3 refracted = glm::refract(wi, mn, eta);
-        bool totalInternalReflection = glm::dot(refracted, refracted) < 1e-8f;
+        // Detect TIR ourselves: GLM 0.9.6 refract() returns NaN (sqrt(k<0) * 0) instead of zero
+        float cosI = -glm::dot(wi, mn);
+        float k = 1.0f - eta * eta * (1.0f - cosI * cosI);
+        bool totalInternalReflection = k < 0.0f;
+        glm::vec3 refracted = totalInternalReflection ? glm::vec3(0.0f) : glm::refract(wi, mn, eta);
 
         float cosTheta = outside ? -glm::dot(wi, mn) : -glm::dot(refracted, mn);
         float r0 = (1.0f - ior) / (1.0f + ior);
