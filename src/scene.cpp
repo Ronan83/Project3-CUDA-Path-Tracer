@@ -247,6 +247,166 @@ static glm::vec3 triCentroid(const Triangle& t)
     return (t.v0 + t.v1 + t.v2) / 3.0f;
 }
 
+
+#define BVH_USE_SAH 1                 // 1 = binned SAH split, 0 = midpoint split
+static const int BVH_SAH_BINS = 16;
+
+static float surfaceArea(glm::vec3 bmin, glm::vec3 bmax)
+{
+    glm::vec3 d = bmax - bmin;
+    return 2.0f * (d.x * d.y + d.y * d.z + d.z * d.x);
+}
+
+// Binned SAH: try BVH_SAH_BINS - 1 candidate planes per axis, return the cheapest.
+// Split cost = A_left * N_left + A_right * N_right (caller normalizes by parent area).
+static float findSAHSplit(const std::vector<Triangle>& tris, int first, int count,
+    glm::vec3 cmin, glm::vec3 cmax, int& bestAxis, float& bestPos)
+{
+    float bestCost = FLT_MAX;
+    bestAxis = -1;
+    bestPos = 0.0f;
+    for (int a = 0; a < 3; a++)
+    {
+        float extent = cmax[a] - cmin[a];
+        if (extent <= 0.0f) continue;
+
+        // Bin triangles by centroid and grow each bin's bounds
+        glm::vec3 binMin[BVH_SAH_BINS], binMax[BVH_SAH_BINS];
+        int binCount[BVH_SAH_BINS];
+        for (int b = 0; b < BVH_SAH_BINS; b++)
+        {
+            binMin[b] = glm::vec3(FLT_MAX);
+            binMax[b] = glm::vec3(-FLT_MAX);
+            binCount[b] = 0;
+        }
+        float scale = BVH_SAH_BINS / extent;
+        for (int i = first; i < first + count; i++)
+        {
+            const Triangle& t = tris[i];
+            int b = std::min(BVH_SAH_BINS - 1, (int)((triCentroid(t)[a] - cmin[a]) * scale));
+            binCount[b]++;
+            binMin[b] = glm::min(binMin[b], glm::min(t.v0, glm::min(t.v1, t.v2)));
+            binMax[b] = glm::max(binMax[b], glm::max(t.v0, glm::max(t.v1, t.v2)));
+        }
+
+        // Sweep from both ends: area and count on each side of every plane
+        float leftArea[BVH_SAH_BINS - 1], rightArea[BVH_SAH_BINS - 1];
+        int leftCount[BVH_SAH_BINS - 1], rightCount[BVH_SAH_BINS - 1];
+        glm::vec3 lMin(FLT_MAX), lMax(-FLT_MAX), rMin(FLT_MAX), rMax(-FLT_MAX);
+        int lSum = 0, rSum = 0;
+        for (int p = 0; p < BVH_SAH_BINS - 1; p++)
+        {
+            lSum += binCount[p];
+            lMin = glm::min(lMin, binMin[p]);
+            lMax = glm::max(lMax, binMax[p]);
+            leftCount[p] = lSum;
+            leftArea[p] = lSum > 0 ? surfaceArea(lMin, lMax) : 0.0f;
+
+            int q = BVH_SAH_BINS - 1 - p;
+            rSum += binCount[q];
+            rMin = glm::min(rMin, binMin[q]);
+            rMax = glm::max(rMax, binMax[q]);
+            rightCount[q - 1] = rSum;
+            rightArea[q - 1] = rSum > 0 ? surfaceArea(rMin, rMax) : 0.0f;
+        }
+
+        for (int p = 0; p < BVH_SAH_BINS - 1; p++)
+        {
+            if (leftCount[p] == 0 || rightCount[p] == 0) continue;
+            float cost = leftArea[p] * leftCount[p] + rightArea[p] * rightCount[p];
+            if (cost < bestCost)
+            {
+                bestCost = cost;
+                bestAxis = a;
+                bestPos = cmin[a] + (p + 1) / scale;
+            }
+        }
+    }
+    return bestCost;
+}
+
+
+
+
+//#define BVH_USE_SAH 1                 // 1 = binned SAH split, 0 = midpoint split
+//static const int BVH_SAH_BINS = 16;
+//
+//static float surfaceArea(glm::vec3 bmin, glm::vec3 bmax)
+//{
+//    glm::vec3 d = bmax - bmin;
+//    return 2.0f * (d.x * d.y + d.y * d.z + d.z * d.x);
+//}
+//
+//// Binned SAH: try BVH_SAH_BINS - 1 candidate planes per axis, return the cheapest.
+//// Split cost = A_left * N_left + A_right * N_right (caller normalizes by parent area).
+//static float findSAHSplit(const std::vector<Triangle>& tris, int first, int count,
+//    glm::vec3 cmin, glm::vec3 cmax, int& bestAxis, float& bestPos)
+//{
+//    float bestCost = FLT_MAX;
+//    bestAxis = -1;
+//    bestPos = 0.0f;
+//    for (int a = 0; a < 3; a++)
+//    {
+//        float extent = cmax[a] - cmin[a];
+//        if (extent <= 0.0f) continue;
+//
+//        // Bin triangles by centroid and grow each bin's bounds
+//        glm::vec3 binMin[BVH_SAH_BINS], binMax[BVH_SAH_BINS];
+//        int binCount[BVH_SAH_BINS];
+//        for (int b = 0; b < BVH_SAH_BINS; b++)
+//        {
+//            binMin[b] = glm::vec3(FLT_MAX);
+//            binMax[b] = glm::vec3(-FLT_MAX);
+//            binCount[b] = 0;
+//        }
+//        float scale = BVH_SAH_BINS / extent;
+//        for (int i = first; i < first + count; i++)
+//        {
+//            const Triangle& t = tris[i];
+//            int b = std::min(BVH_SAH_BINS - 1, (int)((triCentroid(t)[a] - cmin[a]) * scale));
+//            binCount[b]++;
+//            binMin[b] = glm::min(binMin[b], glm::min(t.v0, glm::min(t.v1, t.v2)));
+//            binMax[b] = glm::max(binMax[b], glm::max(t.v0, glm::max(t.v1, t.v2)));
+//        }
+//
+//        // Sweep from both ends: area and count on each side of every plane
+//        float leftArea[BVH_SAH_BINS - 1], rightArea[BVH_SAH_BINS - 1];
+//        int leftCount[BVH_SAH_BINS - 1], rightCount[BVH_SAH_BINS - 1];
+//        glm::vec3 lMin(FLT_MAX), lMax(-FLT_MAX), rMin(FLT_MAX), rMax(-FLT_MAX);
+//        int lSum = 0, rSum = 0;
+//        for (int p = 0; p < BVH_SAH_BINS - 1; p++)
+//        {
+//            lSum += binCount[p];
+//            lMin = glm::min(lMin, binMin[p]);
+//            lMax = glm::max(lMax, binMax[p]);
+//            leftCount[p] = lSum;
+//            leftArea[p] = lSum > 0 ? surfaceArea(lMin, lMax) : 0.0f;
+//
+//            int q = BVH_SAH_BINS - 1 - p;
+//            rSum += binCount[q];
+//            rMin = glm::min(rMin, binMin[q]);
+//            rMax = glm::max(rMax, binMax[q]);
+//            rightCount[q - 1] = rSum;
+//            rightArea[q - 1] = rSum > 0 ? surfaceArea(rMin, rMax) : 0.0f;
+//        }
+//
+//        for (int p = 0; p < BVH_SAH_BINS - 1; p++)
+//        {
+//            if (leftCount[p] == 0 || rightCount[p] == 0) continue;
+//            float cost = leftArea[p] * leftCount[p] + rightArea[p] * rightCount[p];
+//            if (cost < bestCost)
+//            {
+//                bestCost = cost;
+//                bestAxis = a;
+//                bestPos = cmin[a] + (p + 1) / scale;
+//            }
+//        }
+//    }
+//    return bestCost;
+//}
+
+
+
 int Scene::buildBVH(int first, int count)
 {
     int root = (int)bvhNodes.size();
@@ -285,8 +445,52 @@ void Scene::buildBVHNode(int nodeIdx, int first, int count, int depth)
         return;
     }
 
-    // Midpoint split
+    // Midpoint split by default
     float split = cmin[axis] + 0.5f * ext[axis];
+
+#if BVH_USE_SAH
+    int sahAxis;
+    float sahPos;
+    float sahCost = findSAHSplit(triangles, first, count, cmin, cmax, sahAxis, sahPos);
+    if (sahAxis >= 0)
+    {
+        // Expected cost in units of one triangle test: a leaf tests all `count` triangles;
+        // a split pays one traversal step plus each child's triangles weighted by
+        // the chance of hitting that child (its area relative to the parent's)
+        float splitCost = 1.0f + sahCost / surfaceArea(bmin, bmax);
+        if (splitCost >= (float)count && count <= 16)
+        {
+            bvhNodes[nodeIdx].leftOrFirst = first;   // splitting does not pay off
+            bvhNodes[nodeIdx].triCount = count;
+            return;
+        }
+        axis = sahAxis;
+        split = sahPos;
+    }
+#endif
+
+//#if BVH_USE_SAH
+//    int sahAxis;
+//    float sahPos;
+//    float sahCost = findSAHSplit(triangles, first, count, cmin, cmax, sahAxis, sahPos);
+//    if (sahAxis >= 0)
+//    {
+//        // Expected cost in units of one triangle test: a leaf tests all `count` triangles;
+//        // a split pays one traversal step plus each child's triangles weighted by
+//        // the chance of hitting that child (its area relative to the parent's)
+//        float splitCost = 1.0f + sahCost / surfaceArea(bmin, bmax);
+//        if (splitCost >= (float)count && count <= 16)
+//        {
+//            bvhNodes[nodeIdx].leftOrFirst = first;   // splitting does not pay off
+//            bvhNodes[nodeIdx].triCount = count;
+//            return;
+//        }
+//        axis = sahAxis;
+//        split = sahPos;
+//    }
+//#endif
+
+
     auto begin = triangles.begin() + first;
     auto end = begin + count;
     auto mid = std::partition(begin, end,

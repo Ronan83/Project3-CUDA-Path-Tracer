@@ -2,7 +2,7 @@
 #include <cfloat>
 
 __host__ __device__ float boxIntersectionTest(
-    Geom box,
+    const Geom& box,
     Ray r,
     glm::vec3 &intersectionPoint,
     glm::vec3 &normal,
@@ -58,7 +58,7 @@ __host__ __device__ float boxIntersectionTest(
 }
 
 __host__ __device__ float sphereIntersectionTest(
-    Geom sphere,
+    const Geom& sphere,
     Ray r,
     glm::vec3 &intersectionPoint,
     glm::vec3 &normal,
@@ -163,7 +163,7 @@ __host__ __device__ float aabbHitDistance(glm::vec3 bmin, glm::vec3 bmax, glm::v
 }
 
 __host__ __device__ float meshIntersectionTest(
-    Geom mesh,
+    const Geom& mesh,
     const Triangle* triangles,
     const BVHNode* nodes,
     Ray r,
