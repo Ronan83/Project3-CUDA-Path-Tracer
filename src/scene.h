@@ -28,7 +28,7 @@ public:
     std::vector<glm::vec3> texPixels;     // all textures packed, linear RGB
     std::vector<TextureInfo> textures;
     std::unordered_map<std::string, int> texCache;
-    int loadTexture(const std::string& path);
+    int loadTexture(const std::string& path, bool srgb = true);
 
     int envWidth = 0;
     int envHeight = 0;

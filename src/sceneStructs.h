@@ -21,6 +21,7 @@ struct Triangle
     glm::vec3 v0, v1, v2;   
     glm::vec3 n0, n1, n2;   
     glm::vec2 t0, t1, t2;   // texture coordinates
+    glm::vec3 tangent, bitangent;   // per-triangle, object space
 };
 
 
@@ -79,6 +80,10 @@ struct Material
     float roughness;   // GGX roughness, 0 = perfect mirror
     float metallic;    // 1 = metal (F0 = color), 0 = glossy coat over diffuse
     int texId;    // -1 = no texture
+    int procTex;          // 0 = none, 1 = checker
+    float procScale;      // checker cells per unit
+    glm::vec3 procColor2; // second checker color
+    int normalTexId;
 };
 
 struct Camera
@@ -129,4 +134,5 @@ struct ShadeableIntersection
   bool outside;
   glm::vec2 uv;
   int geomId;
+  glm::vec3 tangent, bitangent;
 };

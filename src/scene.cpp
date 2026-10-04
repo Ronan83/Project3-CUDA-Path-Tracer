@@ -90,10 +90,26 @@ void Scene::loadFromJSON(const std::string& jsonName)
         }
 
         newMaterial.texId = -1;
+        // Procedural texture
+        newMaterial.procTex = 0;
+        if (p.contains("PROCEDURAL") && p["PROCEDURAL"] == "Checker") newMaterial.procTex = 1;
+        newMaterial.procScale = p.value("PROC_SCALE", 4.0f);
+        newMaterial.procColor2 = glm::vec3(0.1f);
+        if (p.contains("RGB2")) {
+            const auto& c2 = p["RGB2"];
+            newMaterial.procColor2 = glm::vec3(c2[0], c2[1], c2[2]);
+        }
+
         if (p.contains("TEXTURE"))
         {
             std::string baseDir = jsonName.substr(0, jsonName.find_last_of("/\\") + 1);
             newMaterial.texId = loadTexture(baseDir + p["TEXTURE"].get<std::string>());
+        }
+        newMaterial.normalTexId = -1;
+        if (p.contains("NORMAL_MAP"))
+        {
+            std::string baseDir = jsonName.substr(0, jsonName.find_last_of("/\\") + 1);
+            newMaterial.normalTexId = loadTexture(baseDir + p["NORMAL_MAP"].get<std::string>(), false);
         }
 
         MatNameToID[name] = materials.size();
@@ -309,6 +325,23 @@ void Scene::loadOBJ(const std::string& path, Geom& geom)
             tri.v0 = v[0]; tri.v1 = v[1]; tri.v2 = v[2];
             tri.n0 = n[0]; tri.n1 = n[1]; tri.n2 = n[2];
             tri.t0 = uv[0]; tri.t1 = uv[1]; tri.t2 = uv[2];
+
+            // Tangent frame from UV derivatives (world space, since v[] is world space)
+            glm::vec3 e1 = v[1] - v[0], e2 = v[2] - v[0];
+            glm::vec2 d1 = uv[1] - uv[0], d2 = uv[2] - uv[0];
+            float det = d1.x * d2.y - d2.x * d1.y;
+            if (fabsf(det) > 1e-12f)
+            {
+                float r = 1.0f / det;
+                tri.tangent = (e1 * d2.y - e2 * d1.y) * r;
+                tri.bitangent = (e2 * d1.x - e1 * d2.x) * r;
+            }
+            else
+            {
+                tri.tangent = glm::vec3(1, 0, 0);
+                tri.bitangent = glm::vec3(0, 1, 0);
+            }
+
             triangles.push_back(tri);
 
             for (int k = 0; k < 3; k++)
@@ -610,7 +643,7 @@ void Scene::buildBVHNode(int nodeIdx, int first, int count, int depth)
     buildBVHNode(left + 1, first + leftCount, count - leftCount, depth + 1);
 }
 
-int Scene::loadTexture(const std::string& path)
+int Scene::loadTexture(const std::string& path, bool srgb)
 {
     auto it = texCache.find(path);
     if (it != texCache.end()) return it->second;   // same file shared by several materials
@@ -627,7 +660,8 @@ int Scene::loadTexture(const std::string& path)
     for (int i = 0; i < w * h; i++)
     {
         glm::vec3 s(data[3 * i], data[3 * i + 1], data[3 * i + 2]);
-        texPixels.push_back(glm::pow(s / 255.0f, glm::vec3(2.2f)));   // sRGB -> linear
+        glm::vec3 c = s / 255.0f;
+        texPixels.push_back(srgb ? glm::pow(c, glm::vec3(2.2f)) : c);   // normal maps stay linear
     }
     stbi_image_free(data);
 

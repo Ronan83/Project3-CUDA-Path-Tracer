@@ -373,6 +373,7 @@ __global__ void computeIntersections(
         glm::vec3 tmp_intersect;
         glm::vec3 tmp_normal;
         glm::vec2 tmp_uv(0.0f), uv(0.0f);
+        glm::vec3 tmp_tan(0.0f), tmp_bit(0.0f), hitTan(0.0f), hitBit(0.0f);
 
         // naive parse through global geoms
 
@@ -391,7 +392,7 @@ __global__ void computeIntersections(
             // TODO: add more intersection tests here... triangle? metaball? CSG?
             else if (geom.type == MESH)
             {
-                t = meshIntersectionTest(geom, triangles, bvhNodes, pathSegment.ray, tmp_intersect, tmp_normal, outside, tmp_uv);
+                t = meshIntersectionTest(geom, triangles, bvhNodes, pathSegment.ray, tmp_intersect, tmp_normal, outside, tmp_uv, tmp_tan, tmp_bit);
             }
             // Compute the minimum t from the intersection tests to determine what
             // scene geometry object was hit first.
@@ -403,6 +404,8 @@ __global__ void computeIntersections(
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
                 uv = (geom.type == MESH) ? tmp_uv : glm::vec2(0.0f);
+                hitTan = (geom.type == MESH) ? tmp_tan : glm::vec3(0.0f);
+                hitBit = (geom.type == MESH) ? tmp_bit : glm::vec3(0.0f);
             }
         }
 
@@ -418,6 +421,8 @@ __global__ void computeIntersections(
             intersections[path_index].surfaceNormal = normal;
             intersections[path_index].outside = hit_outside;
             intersections[path_index].uv = uv;
+            intersections[path_index].tangent = hitTan;
+            intersections[path_index].bitangent = hitBit;
             intersections[path_index].geomId = hit_geom_index;
         }
     }
@@ -549,12 +554,13 @@ __device__ bool isOccluded(Ray r, const Geom* geoms, int geomsSize,
     const Triangle* tris, const BVHNode* nodes, float maxT) {
     glm::vec3 p, nrm; bool outside;
     glm::vec2 uvDummy;
+    glm::vec3 tDummy, bDummy;
     for (int i = 0; i < geomsSize; ++i) {
         const Geom& g = geoms[i];
         float t = -1.0f;
         if (g.type == CUBE) t = boxIntersectionTest(g, r, p, nrm, outside);
         else if (g.type == SPHERE) t = sphereIntersectionTest(g, r, p, nrm, outside);
-        else if (g.type == MESH) t = meshIntersectionTest(g, tris, nodes, r, p, nrm, outside, uvDummy);
+        else if (g.type == MESH) t = meshIntersectionTest(g, tris, nodes, r, p, nrm, outside, uvDummy, tDummy, bDummy);
         if (t > 0.0f && t < maxT) return true;
     }
     return false;
@@ -588,6 +594,12 @@ __device__ void sampleLightPoint(const Geom& g, thrust::default_random_engine& r
     n = glm::normalize(glm::vec3(g.invTranspose * glm::vec4(ln, 0.0f)));
 }
 
+// 3D world-space checker, needs no UVs
+__device__ glm::vec3 proceduralTexture(const Material& m, glm::vec3 p) {
+    glm::vec3 q = glm::floor(p * m.procScale + 1e-4f);
+    int parity = ((int)q.x + (int)q.y + (int)q.z) & 1;
+    return parity ? m.procColor2 : m.color;
+}
 
 __global__ void shadeMaterial(
     int iter,
@@ -643,6 +655,25 @@ __global__ void shadeMaterial(
     Material m = materials[isect.materialId];
 
     if (m.texId >= 0) m.color *= sampleTexture(texPixels, texInfo[m.texId], isect.uv);
+
+    if (m.procTex == 1) {
+        glm::vec3 hitP = getPointOnRay(seg.ray, isect.t);
+        m.color = proceduralTexture(m, hitP);
+    }
+
+    // Normal mapping: tangent-space normal -> world space
+    if (m.normalTexId >= 0) {
+        glm::vec3 N = glm::normalize(isect.surfaceNormal);
+        glm::vec3 T = isect.tangent - N * glm::dot(N, isect.tangent);   // Gram-Schmidt
+        if (glm::dot(T, T) > 1e-12f) {
+            T = glm::normalize(T);
+            glm::vec3 B = glm::cross(N, T);
+            if (glm::dot(B, isect.bitangent) < 0.0f) B = -B;           // mirrored UVs
+            glm::vec3 tn = sampleTexture(texPixels, texInfo[m.normalTexId], isect.uv) * 2.0f - 1.0f;
+            glm::vec3 Np = glm::normalize(tn.x * T + tn.y * B + tn.z * N);
+            if (isfinite(Np.x)) isect.surfaceNormal = Np;
+        }
+    }
 
     if (m.emittance > 0.0f) {
         glm::vec3 Le = m.color * m.emittance;
