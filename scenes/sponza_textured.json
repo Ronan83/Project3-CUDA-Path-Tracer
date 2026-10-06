@@ -209,8 +209,8 @@
         }
     },
     "Environment": {
-        "FILE": "hdr/kloofendal_48d_partly_cloudy_puresky_4k.hdr",
-        "INTENSITY": 1.0,
+        "FILE": "hdr/venice_sunset_8k.hdr",
+        "INTENSITY": 6.0,
         "ROTATION": 0
     },
     "Camera": {
