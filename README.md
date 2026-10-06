@@ -9,10 +9,23 @@ CUDA Path Tracer
 ![Sci-fi corridor, 5000 spp](img/cover.jpg)
 *Sci-fi corridor: 9 OBJ meshes (~152k triangles), GGX metal panels, emissive light strips, HDR bloom and ACES tone mapping. 1920x1080, 5000 samples per pixel, ~108 ms per iteration including bloom.*
 
-A physically based, GPU-only path tracer written in CUDA. Every bounce of every path runs as a stream of kernels (generate → intersect → shade → compact), with a BVH for meshes, importance-sampled HDR environment lighting, next event estimation with multiple importance sampling, GGX microfacet materials, textures and normal maps.
+A physically based path tracer written in CUDA. All rendering runs on the GPU; only the BVH and the environment-map CDF are built once on the CPU. Every bounce of every path runs as a stream of kernels (generate → intersect → shade → compact), with a BVH for meshes, importance-sampled HDR environment lighting, next event estimation with multiple importance sampling, GGX microfacet materials, textures and normal maps. Every optimization below was measured on and off, and material sorting ships disabled because the numbers said so.
+
+## Key results
+
+| | Result | Details |
+|---|---|---|
+| **211×** | faster rendering of a 69k-triangle mesh with the SAH BVH | [BVH](#bvh-binned-sah) |
+| **175×** | slowdown in glass scenes traced to NaN rays from a GLM `refract` bug, found with a device-side counter and fixed | [Debugging story](#debugging-story-the-18-fps-glass-bunny) |
+| **2.3×** | faster rendering of the closed sci-fi corridor with Russian roulette (242 → 106 ms per iteration) | [Russian roulette](#russian-roulette) |
+| **~2.5×** | less noise at equal sample count with area-light NEE + MIS, mean brightness unchanged | [Area-light NEE](#area-light-nee--mis) |
+| **−30% / +67%** | stream compaction speeds up open scenes but *slows down* closed ones | [Stream compaction](#stream-compaction-open-vs-closed-scenes) |
+| **~4× slower** | sorting paths by material: measured, explained, left off | [Material sorting](#material-sorting) |
+| **50 FPS** | progressive preview of the textured helmets scene with a still camera (1600x900, 39k triangles, 8K HDRI) | [Gallery](#gallery) |
 
 ## Contents
 
+- [Key results](#key-results)
 - [Feature overview](#feature-overview)
 - [Gallery](#gallery)
 - [Core path tracer](#core-path-tracer)
@@ -25,6 +38,9 @@ A physically based, GPU-only path tracer written in CUDA. Every bounce of every 
 - [Performance analysis](#performance-analysis)
 - [Debugging story: the 1.8 FPS glass bunny](#debugging-story-the-18-fps-glass-bunny)
 - [Bloopers](#bloopers)
+- [Lessons learned](#lessons-learned)
+- [Building and running](#building-and-running)
+- [Code map](#code-map)
 - [Scene file format](#scene-file-format)
 - [Build notes and third-party code](#build-notes-and-third-party-code)
 - [References](#references)
@@ -40,7 +56,7 @@ A physically based, GPU-only path tracer written in CUDA. Every bounce of every 
 | Materials | GGX microfacet metal and glossy (dielectric coat over diffuse), VNDF sampling | `"Metal"`, `"Glossy"` |
 | Lighting | HDR environment map (equirectangular, rotation, intensity) | `"Environment"` block |
 | Lighting | Environment importance sampling (luminance × sin θ CDF) | `ENV_NEE` |
-| Lighting | Next event estimation for environment and area lights, MIS with the power heuristic | `ENV_NEE`, `LIGHT_NEE` |
+| Lighting | Next event estimation on diffuse surfaces toward the environment and cube / sphere lights, MIS with the power heuristic | `ENV_NEE`, `LIGHT_NEE` |
 | Camera | Thin-lens depth of field | `LENS_RADIUS`, `FOCAL_DISTANCE` |
 | Meshes | OBJ loading (normals, UVs) with toggleable bounding-box culling | `MESH_BBOX_CULLING` |
 | Acceleration | BVH, binned SAH build on the CPU, iterative near-first traversal on the GPU | `USE_BVH`, `BVH_USE_SAH` |
@@ -73,11 +89,29 @@ A physically based, GPU-only path tracer written in CUDA. Every bounce of every 
 
 ## Core path tracer
 
-Each iteration shoots one jittered camera ray per pixel and then loops over bounces. One bounce is three kernels:
+Each iteration shoots one jittered camera ray per pixel and then loops over bounces. One thread owns one path, and every stage is its own kernel, so the number of threads launched shrinks as paths terminate:
+
+```mermaid
+flowchart LR
+    CAM["generateRayFromCamera<br/>1 thread per pixel<br/>AA jitter + thin lens"] --> ISECT
+    subgraph LOOP ["one bounce, repeated until no path is alive or max depth"]
+        ISECT["computeIntersections<br/>spheres, cubes,<br/>meshes via BVH"] --> SORT["sort by material<br/>(optional, off)"]
+        SORT --> SHADE["shadeMaterial<br/>NEE + MIS (written to image),<br/>BSDF sample, roulette"]
+        SHADE --> COMPACT["thrust::partition<br/>keep alive paths"]
+        COMPACT -->|"paths left"| ISECT
+    end
+    COMPACT --> GATHER["finalGather<br/>add path radiance to image"]
+    GATHER --> POST["bloom + ACES<br/>display / save"]
+```
 
 1. **`computeIntersections`**: one thread per alive path finds the closest hit (spheres, cubes, meshes through the BVH).
 2. **`shadeMaterial`**: one thread per path evaluates the material, adds next-event-estimation contributions, samples the next direction, and applies Russian roulette.
 3. **Stream compaction**: `thrust::partition` moves the paths that are still alive to the front of the array, so the next bounce only launches threads for them.
+
+The image converges progressively: every iteration adds one sample per pixel to a linear HDR accumulation buffer (about 8.6 iterations per second for the 1080p corridor). Moving the camera restarts the accumulation and, as in the base code, re-uploads all scene buffers.
+
+![Convergence](img/convergence.jpg)
+*The cover scene after 1, 8, 64, 512 and 5000 samples per pixel (center crop).*
 
 **BSDFs.** Diffuse surfaces use cosine-weighted hemisphere sampling (throughput multiplies by the albedo, the cosine and the pdf cancel). Perfect mirrors reflect about the normal.
 
@@ -105,7 +139,7 @@ The top row of the GGX image shows roughness 0.05, 0.15, 0.3, 0.5, 0.8 for gold;
 
 **GPU vs CPU.** A CPU tracer would do the same per-sample math, but it has no warps, so mixing materials costs nothing extra there. On the GPU the shading kernel is short in most test scenes (about 1–5 ms per iteration; Sponza with 22 textures is the exception at 27 ms), so divergence is a minor cost compared with intersection and compaction.
 
-**Future work.** NEE currently runs only on diffuse surfaces (glossy lobes skip MIS), so small light sources reflected in rough metal converge slower than they could. Adding light sampling + MIS for the GGX lobes would fix that.
+**Future work.** NEE currently runs only on purely diffuse surfaces: Metal and Glossy materials (including Glossy's diffuse base) rely on BSDF sampling alone, and emissive meshes are not in the light list. The metal-and-neon cover scene therefore gets no help from NEE. Light sampling + MIS for the GGX lobes and triangle-mesh emitters would fix that.
 
 ## Lighting and sampling
 
@@ -129,13 +163,13 @@ A bright sun covers a tiny fraction of the sphere, so BSDF sampling almost never
 | Glass bunny scene: RMSE vs 5000 spp reference | 0.0477 | **0.0387** (−19%) |
 | Diffuse bunny: high-frequency noise | 0.0310 | **0.0228** (−26%) |
 | Shade kernel time (diffuse bunny) | 0.8 ms | 3.2 ms |
-| Mean image brightness | 0.6322 | 0.6335 (same: no bias) |
+| Mean image brightness | 0.6322 | 0.6335 (unchanged, consistent with no bias) |
 
 **Performance.** The extra cost is one CDF binary search (25 steps for an 8K map) and one shadow ray per diffuse hit: +2.4 ms per iteration in the diffuse-bunny scene, +1.7 ms in the glass-bunny scene. For the same noise level BSDF-only sampling needs roughly 1.5–1.9× more samples, so it pays off.
 
-**GPU vs CPU.** The CDF is built once on the CPU (33.6M pixels, double-precision prefix sum) and uploaded. A binary search is a good fit for the GPU: it is short, branch-light, and every thread does the same number of steps.
+**GPU vs CPU.** The CDF is built once on the CPU (33.6M pixels, double-precision prefix sum) and uploaded. On the GPU the binary search is latency-bound: 25 dependent, scattered loads into a 134 MB CDF per sample. Together with the shadow ray, the whole environment-NEE step adds about 2.4 ms per iteration in the diffuse-bunny scene.
 
-**Future work.** A 2D (marginal + conditional) CDF would cut the search to two short searches and improve cache locality. A guide-map or MIS compensation (Karlík 2019) would reduce the remaining variance from the sky.
+**Future work.** An alias table would make each sample O(1) with two loads; a 2D (marginal + conditional) CDF would at least split the search into two short, cache-friendlier ones. A guide-map or MIS compensation (Karlík 2019) would reduce the remaining variance from the sky.
 
 ### Area-light NEE + MIS
 
@@ -143,7 +177,7 @@ Emissive cubes and spheres are collected into a light list when the scene loads.
 
 ![Area-light NEE, 20 spp](img/cmp_area_nee.jpg)
 
-At 20 spp the mean brightness matches BSDF sampling (0.1381 vs 0.1365, unbiased) while the per-channel relative noise drops from 0.93/1.03/1.10 to 0.41/0.38/0.45, **about 2.5× less noise**, which is roughly 6× fewer samples for the same quality.
+At 20 spp the mean brightness matches BSDF sampling (0.1381 vs 0.1365, consistent with no bias) while the per-channel relative noise drops from 0.93/1.03/1.10 to 0.41/0.38/0.45, **about 2.5× less noise**, which is roughly 6× fewer samples for the same quality.
 
 ## Camera
 
@@ -154,7 +188,7 @@ The camera ray starts at a uniformly sampled point on a lens disk of radius `LEN
 ![Depth of field in the Cornell box](img/cmp_dof_cornell.jpg)
 ![Depth of field with the glass bunny](img/dof_bunny.jpg)
 
-**Performance.** Two extra random numbers and a few multiplies per camera ray; not measurable next to the bounce loop. A CPU version would be equally cheap; the feature is about correctness, not speed.
+**Performance.** Two extra random numbers and a few multiplies per camera ray; not measurable next to the bounce loop.
 
 ## Meshes and acceleration
 
@@ -164,7 +198,7 @@ OBJ files are loaded with tinyobjloader. Triangles are stored in world space wit
 
 ### BVH (binned SAH)
 
-Each mesh gets its own BVH, built on the CPU and flattened into one array of 32-byte nodes (two nodes per 64-byte cache line). Children are stored next to each other, so a node only needs one index.
+Each mesh gets its own BVH, built on the CPU and flattened into one array of 32-byte nodes (one node per 32-byte memory sector). Children are stored next to each other, so a node only needs one index.
 
 * **Build:** binned SAH with 16 bins per axis. Nodes with ≤ 4 triangles always become leaves, and nodes with ≤ 16 triangles also become leaves when the SAH cost of the best split is no better than testing every triangle.
 * **Traversal:** iterative with a 64-entry per-thread stack. Both children are tested; the nearer child is visited first and the farther one is pushed with its entry distance, and a popped node is skipped if a closer hit was already found ("closest-hit pruning"). NEE shadow rays use the same traversal.
@@ -176,7 +210,7 @@ Each mesh gets its own BVH, built on the CPU and flattened into one array of 32-
 | Torus knot (4.8k triangles) | 337.2 ms | 17.6 ms | 19× |
 | Stanford bunny (69k triangles) | 2466.2 ms | 11.7 ms | 211× |
 
-The speedup grows with triangle count because the brute-force cost is linear in triangles while BVH traversal is roughly logarithmic.
+The speedup grows with triangle count, partly because the brute-force cost is linear in triangles while BVH traversal is roughly logarithmic (the two scenes also differ in lighting, so this is not a controlled comparison). With the BVH off, NEE shadow rays are brute-force too, which is why shade time explodes as well.
 
 ![SAH vs midpoint](img/perf_sah.png)
 
@@ -187,7 +221,7 @@ The speedup grows with triangle count because the brute-force cost is linear in 
 | Helmets | SAH | 25,850 | 25.8 ms | **3.45 ms** |
 | Helmets | Midpoint | 26,886 | 8.8 ms | 3.96 ms |
 
-SAH traversal is about **13% faster** on both scenes. The build is 2–3× slower, but it runs once and is paid back after 35–45 iterations of a 5000-iteration render.
+SAH traversal is about **13% faster** on both scenes. The build is 2–3× slower, but it runs once and is paid back after 33–45 iterations of a 5000-iteration render.
 
 **GPU vs CPU.** Building on the CPU is simple and fast enough (tens of milliseconds). The traversal is where the GPU has to be careful: recursion is replaced by an explicit stack, and incoherent secondary rays make warps take different paths through the tree, which is why intersect time grows after the first bounce even though fewer paths are alive.
 
@@ -210,7 +244,7 @@ A 3D checker computed from the world-space hit point: `parity(floor(p · scale))
 | Image texture (4 texel fetches, bilinear) | 1.134 ms |
 | Procedural checker (a few ALU ops) | 1.10 ms |
 
-The procedural texture is about **3% faster**: it trades 4 global-memory reads for a handful of instructions, but texture lookups are a small part of shading, so the gap is small. The procedural version also has no memory footprint, while the image version scales to any detail.
+There is **no measurable difference** (1.10 vs 1.13 ms is within run-to-run noise): the procedural texture trades 4 global-memory reads for a handful of instructions, but texture lookups are a small part of shading. The procedural version also has no memory footprint, while the image version scales to any detail.
 
 ### Normal mapping
 
@@ -237,7 +271,7 @@ The accumulated image stays in linear HDR. For display and saving it goes throug
 
 ![Bloom](img/cmp_bloom.jpg)
 
-**Performance.** About **3.6 ms per frame** at 1080p with radius 32 (104.5 → 108.1 ms in the corridor). On the GPU each pixel is independent, so both blur passes are embarrassingly parallel; a CPU version would spend seconds on a 65-tap blur over 2 million pixels.
+**Performance.** About **3.6 ms per frame** at 1080p with radius 32 (104.5 → 108.1 ms in the corridor). Every output pixel is independent, so both blur passes are embarrassingly parallel; the same 65-tap blur over 2 million pixels is about a billion multiply-adds per frame, which is why it belongs on the GPU next to the image it reads.
 
 **Future work.** Run the bloom only when the display is refreshed instead of every iteration, use shared memory tiles for the blur, and use a downsampled mip chain to get wide glows cheaply.
 
@@ -263,7 +297,7 @@ In the **open** scene (diffuse bunny under an HDRI), 47% of paths escape after t
 | Open bunny + HDRI | off | 12.03 | 4.57 | 0 | 16.60 |
 
 * **Open scene: compaction is a clear win (−30%).** Without it, terminated paths keep occupying threads and their stale rays are still intersected every bounce, so intersect time grows 4.4×.
-* **Closed scene: compaction is a net loss.** It does cut intersect and shade time by about 40%, but `thrust::partition` costs 12.7 ms per iteration: it moves whole `PathSegment` structs (ray, throughput, pixel index, bounce count, pdf) every bounce, while very few paths are removed.
+* **Closed scene: compaction is a net loss.** It does cut intersect and shade time by about 40%, but `thrust::partition` costs 12.7 ms per iteration: it moves whole `PathSegment` structs (ray, throughput, pixel index, bounce count, pdf) and allocates temporary storage every bounce, while Russian roulette removes only 15–30% of the paths per bounce and nothing escapes.
 
 **Future optimization:** compact a 4-byte index array (or the path indices with a custom scan) instead of the full structs, and skip compaction when few paths died this bounce.
 
@@ -278,7 +312,7 @@ In the **open** scene (diffuse bunny under an HDRI), 47% of paths escape after t
 | Textured helmets | off | 0 | 1.33 | **12.42** |
 | Textured helmets | on | 37.61 | 1.54 | 50.75 |
 
-Sorting makes the frame **4× slower** and does not even make shading faster. My scenes have few materials and shading is short (about 1–2 ms here), so there is little divergence to remove, while `thrust::sort_by_key` with a struct comparator falls back to a comparison sort that moves both the intersections and the path segments. Sorting would only pay off with many materials and expensive BSDFs; the cheaper way to get there is a radix sort on 32-bit material keys that only permutes an index array. The toggle stays off by default.
+Sorting makes the frame **about 4× slower** (3.9× and 4.1×) and does not even make shading faster. My scenes have few materials and shading is short (about 1–2 ms here), so there is little divergence to remove, while `thrust::sort_by_key` with a struct comparator falls back to a comparison sort that moves both the intersections and the path segments. Sorting would only pay off with many materials and expensive BSDFs; the cheaper way to get there is a radix sort on 32-bit material keys that only permutes an index array. The toggle stays off by default.
 
 ### Russian roulette
 
@@ -290,7 +324,7 @@ From bounce 3 on, a path survives with probability `p = min(1, max(throughput.r,
 | Scene | RR off | RR on | Speedup |
 |---|---|---|---|
 | Sci-fi corridor (closed, 1080p, depth 10) | 241.8 ms | **105.9 ms** | 2.3× |
-| Cornell box (closed, depth 8) | 13.7 ms | **12.4 ms** | 1.1× |
+| Cornell box (open front, depth 8) | 13.7 ms | **12.4 ms** | 1.1× |
 
 In the corridor the dark metal walls absorb most of the energy but no ray can escape, so without roulette 28% of paths are still alive at bounce 9. Roulette removes the paths that would contribute almost nothing. The effect is largest exactly where stream compaction alone fails: in closed scenes.
 
@@ -304,7 +338,16 @@ In the corridor the dark metal walls absorb most of the energy but no ray can es
 
 ### Where the time goes
 
-Across the test scenes in their default configuration **stream compaction is usually the largest single kernel** (5.7–22 ms), followed by intersection. That makes "compact indices instead of structs" the most promising next optimization. A full wavefront architecture (one kernel per material type, with queues instead of a sort) is the natural next step after that.
+Across the test scenes in their default configuration **stream compaction is usually the largest single kernel** (5.7–22 ms), followed by intersection. That makes "compact indices instead of structs" a likely next optimization, to be confirmed with Nsight Compute (part of the cost may be thrust's temporary allocation rather than the data movement).
+
+![Kernel time per bounce](img/perf_bounce_cost.png)
+
+Two more things stand out when every bounce is timed separately:
+
+* **The tail is mostly overhead.** In the open bunny scene, bounces 3–11 hold less than 1% of the paths yet still cost 0.85 ms of the ~2.7 ms of intersection time in that iteration: each launch pays a fixed cost plus the latency of a few warps walking the BVH alone, while the rest of the GPU idles for 9 of the 12 bounces. Path regeneration (start new camera paths in freed slots) or an adaptive depth cap would fill it.
+* **Secondary rays are 4× more expensive than camera rays.** In the corridor, bounce 0 costs 4.0 ns per path and bounce 1 costs 16.6 ns per path, although there are fewer of them. Camera rays in a warp are neighbors and walk the same BVH nodes; after a bounce off rough metal they scatter in all directions, so the warp most likely diverges and misses cache. Sorting rays by origin and direction before traversal is one proposed fix.
+
+A full wavefront architecture (one kernel per material type, with queues instead of a sort) is the natural next step after that.
 
 ---
 
@@ -312,7 +355,7 @@ Across the test scenes in their default configuration **stream compaction is usu
 
 The glass bunny at sunset ran at **1.8 FPS**, while the same bunny made of chrome or diffuse material needed only about 2.5 ms per iteration to intersect. My first guess was broken mesh normals; the loader reported zero. Swapping materials showed it was only glass, and per-bounce timing showed something odd: one bounce with only **6 alive paths took 48 ms**.
 
-I added a device counter for rays whose origin or direction was not finite: **18% of the glass rays were NaN**. A NaN ray fails every bounding-box test in a way that never prunes, so it walks the entire BVH, and a single such thread stalls its whole warp.
+I added a device counter for rays whose origin or direction was not finite: **18% of the glass rays were NaN**. Every comparison with NaN is false, so the "missed the box" test never fires and the entry distance clamps to 0: a NaN ray enters every BVH node, and a single such thread stalls its whole warp.
 
 The cause was GLM 0.9.6's vector `refract`: on total internal reflection it computes `(… sqrt(k) …) * (k >= 0)`, and with `k < 0` that is `NaN * 0 = NaN`, not zero. The fix is to test `k < 0` myself and reflect in that case.
 
@@ -322,7 +365,7 @@ The cause was GLM 0.9.6's vector `refract`: on total internal reflection it comp
 | Intersect time | 702 ms | **4.0 ms** |
 | Frame rate | 1.8 FPS | **41.8 FPS** |
 
-The fix also removed dark speckles from the glass. As a safety net, `computeIntersections` now drops non-finite rays, and the final gather ignores non-finite samples.
+The fix also removed dark streaks and speckles from the glass. As a safety net, `computeIntersections` now drops non-finite rays, and the final gather ignores non-finite samples.
 
 ## Bloopers
 
@@ -330,6 +373,48 @@ The fix also removed dark speckles from the glass. As a safety net, `computeInte
 |---|---|
 | ![Camera bug](img/blooper_camera.jpg) | ![NaN rays](img/blooper_nan.jpg) |
 | *The GGX test scene, seen from under the floor. The base code's orbit camera derived its pitch and yaw with mirrored angles, so the camera started below the stage instead of at the `EYE` in the scene file. Fixed by deriving θ and φ from the actual eye-to-target offset.* | *Glass bunny before the TIR fix: NaN rays leave dark streaks inside the glass, and made the intersection kernel 175× slower.* |
+
+## Lessons learned
+
+* **Measure every optimization in both directions.** Of two textbook optimizations, one helps only open scenes and the other is a 4× slowdown here.
+* **Count the bad cases.** A device-side counter for non-finite rays turned a vague "glass is slow" into a one-line fix.
+* **Time per bounce, not only per frame.** Frame averages hid the idle tail and the 4× cost of secondary rays.
+* **Validate sampling code statistically.** Each new sampling strategy (environment NEE, area-light NEE) was checked by comparing mean image brightness with plain BSDF sampling at the same sample count. Matching means are consistent with an unbiased estimator; lower noise shows it actually helps.
+
+## Building and running
+
+**Requirements:** Windows 10/11, Visual Studio 2022, CUDA Toolkit 12.8 or newer (needed for RTX 50-series; tested with 13.3), CMake ≥ 3.24, and an NVIDIA GPU. The project builds with `CUDA_ARCHITECTURES native`, so the GPU has to be visible while compiling (on hybrid-graphics laptops, make sure the discrete GPU is enabled).
+
+```
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+```
+
+Open `build/cis565_path_tracer.sln`, select **Release**, set *Project Properties → Debugging → Command Arguments* to a scene such as `../scenes/scifi_corridor.json`, and run.
+
+**Controls:** left mouse drag to orbit, right mouse drag (vertical) to zoom, middle mouse drag to move the look-at point, Space to reset the look-at point, S to save an image, Esc to save and exit. The render stops and saves automatically after the scene's `ITERATIONS`.
+
+**Compile-time switches** (all default to the configuration used for the results above; `PROFILE` and `ERRORCHECK` synchronize the device after kernels, so the frame rates quoted include that overhead):
+
+| Switch | File | Default |
+|---|---|---|
+| `STREAM_COMPACTION`, `SORT_BY_MATERIAL`, `RUSSIAN_ROULETTE` | `src/pathtrace.cu` | 1, 0, 1 |
+| `ENV_NEE`, `LIGHT_NEE` | `src/pathtrace.cu` | 1, 1 |
+| `PROFILE`, `PROFILE_WINDOW`, `LOG_BOUNCE_ITER`, `ERRORCHECK` | `src/pathtrace.cu` | 1, 200, 10, 1 |
+| `USE_BVH`, `MESH_BBOX_CULLING` | `src/intersections.h` | 1, 1 |
+| `BVH_USE_SAH` | `src/scene.cpp` | 1 |
+
+## Code map
+
+| File | What it contains |
+|---|---|
+| `src/pathtrace.cu` | All path-tracing kernels: camera rays, intersection loop, shading with NEE + MIS, environment sampling, stream compaction and sorting, final gather, bloom, the CUDA-event profiler |
+| `src/interactions.cu` | BSDF sampling: diffuse, mirror, GGX VNDF metal / glossy, smooth and rough glass |
+| `src/intersections.cu` | Ray–box, ray–sphere and ray–triangle tests, iterative BVH traversal |
+| `src/scene.cpp` | JSON scene loading, OBJ loading with UVs and tangents, texture packing, environment CDF, binned-SAH BVH build |
+| `src/sceneStructs.h` | GPU data layout: `PathSegment`, `ShadeableIntersection`, `Material`, `Triangle`, 32-byte `BVHNode` |
+| `src/utilities.h` | ACES tone mapping and display conversion |
+| `src/main.cpp` | Window, camera controls, image saving |
+| `perf/` | Raw benchmark logs and result tables |
 
 ## Scene file format
 
