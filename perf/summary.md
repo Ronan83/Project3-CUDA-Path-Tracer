@@ -1,4 +1,4 @@
-# Performance results (RTX 5070, Release, CUDA 13.3, 2026-10-05)
+# Performance results (RTX 5070 Laptop GPU, Release, CUDA 13.3, 2026-10-05)
 
 Times are per-iteration averages over 200 iterations (20 for the no-BVH runs, 10 for the 20 spp NEE runs), measured with CUDA events. Raw console output is in `raw_logs.txt`.
 Total = intersect + sort + shade + compact (path-tracing kernels only).

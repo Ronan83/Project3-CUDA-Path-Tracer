@@ -4,7 +4,7 @@ CUDA Path Tracer
 **University of Pennsylvania, CIS 5650: GPU Programming and Architecture, Project 3**
 
 * Xuan Zhu
-* Tested on: Windows 11 (build 26200), NVIDIA GeForce RTX 5070 12 GB, CUDA 13.3, Visual Studio 2022 (MSVC 19.44), Release build
+* Tested on: Windows 11, AMD Ryzen AI 7 350, 32GB DDR5, NVIDIA GeForce RTX 5070 Laptop GPU (Personal computer)
 
 ![Sci-fi corridor, 5000 spp](img/cover.jpg)
 *Sci-fi corridor: 9 OBJ meshes (~152k triangles), GGX metal panels, emissive light strips, HDR bloom and ACES tone mapping. 1920x1080, 5000 samples per pixel, ~108 ms per iteration including bloom.*
@@ -51,12 +51,17 @@ A physically based, GPU-only path tracer written in CUDA. Every bounce of every 
 
 ## Gallery
 
-| | |
-|---|---|
-| ![Textured helmets](img/helmets_textured.jpg) | ![Procedural texture](img/helmets_procedural.jpg) |
-| *Image textures + normal maps (Khronos sample helmets, 39k triangles), studio HDRI* | *Procedural checker floor and helmet next to an image-textured helmet* |
-| ![GGX spheres](img/ggx_spheres.jpg) | ![Glass bunny](img/glass_bunny_sunset.jpg) |
-| *Top: GGX gold, roughness 0.05 → 0.8. Bottom: rough glass, roughness 0 → 0.5* | *Glass Stanford bunny (69k triangles) at sunset, importance-sampled 8K HDRI* |
+![Textured helmets](img/helmets_textured.jpg)
+*Image textures + normal maps (Khronos sample helmets, 39k triangles), studio HDRI.*
+
+![Procedural texture](img/helmets_procedural.jpg)
+*Procedural checker floor and helmet next to an image-textured helmet.*
+
+![GGX spheres](img/ggx_spheres.jpg)
+*Top: GGX gold, roughness 0.05 → 0.8. Bottom: rough glass, roughness 0 → 0.5.*
+
+![Glass bunny](img/glass_bunny_sunset.jpg)
+*Glass Stanford bunny (69k triangles) at sunset, importance-sampled 8K HDRI.*
 
 ![Crytek Sponza](img/sponza.jpg)
 *Crytek Sponza (227k triangles, 22 image textures), lit only by the 8K sunset HDRI through the open roof. 1600x900, 2000 spp, ~99 ms per iteration.*
@@ -240,7 +245,7 @@ The accumulated image stays in linear HDR. For display and saving it goes throug
 
 ## Performance analysis
 
-All timings: RTX 5070, Release build, CUDA events around each kernel, averaged over 200 iterations (10–20 iterations for the very slow BVH-off runs and the 20 spp NEE runs). Raw logs are in [`perf/raw_logs.txt`](perf/raw_logs.txt) and tables in [`perf/summary.md`](perf/summary.md).
+All timings: RTX 5070 Laptop GPU, Release build, CUDA events around each kernel, averaged over 200 iterations (10–20 iterations for the very slow BVH-off runs and the 20 spp NEE runs). Raw logs are in [`perf/raw_logs.txt`](perf/raw_logs.txt) and tables in [`perf/summary.md`](perf/summary.md).
 
 ### Stream compaction: open vs closed scenes
 
